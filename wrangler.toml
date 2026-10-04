@@ -1,0 +1,28 @@
+name = "postbeam"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+[observability]
+enabled = true
+
+# 秘密情報は `wrangler secret put <NAME>` で登録する（README の「シークレット」を参照）
+# MISSKEY_HOOK_SECRET / BUFFER_API_KEY / BUFFER_CHANNEL_ID
+# X_API_KEY / X_API_SECRET / X_ACCESS_TOKEN / X_ACCESS_SECRET
+
+[vars]
+# 投稿先: "buffer" または "x"
+POSTER = "buffer"
+# 転送する公開範囲（カンマ区切り）
+VISIBILITIES = "public,home"
+# CW 付きノートの扱い: "skip"（転送しない）または "include"（CW 文と本文を続けて転送）
+CW_MODE = "skip"
+# 返信を転送するか
+INCLUDE_REPLIES = "false"
+# このタグが付いたノートは転送しない（カンマ区切り、# なし）
+EXCLUDE_TAGS = "nox"
+# 元ノートへのリンク: "never" / "truncated"（切り詰めたときだけ）/ "always"
+APPEND_LINK = "never"
+# センシティブ指定の画像も添付するか
+ATTACH_SENSITIVE = "false"
+# カスタム絵文字（:name:）を除去するか
+STRIP_CUSTOM_EMOJI = "true"

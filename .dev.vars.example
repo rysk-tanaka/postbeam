@@ -1,0 +1,14 @@
+# `pnpm dev` でローカル実行するときのシークレット。
+# このファイルを .dev.vars にコピーして値を入れる（.dev.vars は git 管理外）。
+
+MISSKEY_HOOK_SECRET=change-me
+
+# POSTER=buffer のとき
+BUFFER_API_KEY=
+BUFFER_CHANNEL_ID=
+
+# POSTER=x のとき
+X_API_KEY=
+X_API_SECRET=
+X_ACCESS_TOKEN=
+X_ACCESS_SECRET=
