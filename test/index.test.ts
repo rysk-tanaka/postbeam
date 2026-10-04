@@ -132,6 +132,21 @@ describe("handleRequest", () => {
       channelId: "channel-1",
       assets: [{ image: { url: "https://f/a.png" } }],
     });
+    expect(sent.query).toContain("$assets: [AssetInput!]!");
+  });
+
+  test("画像がないときは assets を送らない（Buffer は null を受け付けない）", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const fetcher = mockFetch(200, bufferOk);
+    await handleRequest(request(makePayload()), bufferEnv, fetcher);
+
+    const [, init] = fetcher.mock.calls[0] ?? [];
+    const sent = JSON.parse(String(init?.body));
+    expect(sent.query).not.toContain("assets");
+    expect(sent.variables).toEqual({
+      text: "こんにちは",
+      channelId: "channel-1",
+    });
   });
 
   test("Buffer が投稿を拒否したら 422（Misskey は再送しない）", async () => {

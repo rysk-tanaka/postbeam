@@ -4,19 +4,27 @@ import { type Poster, PosterError, type PostResult } from "./types";
 
 export const BUFFER_API_URL = "https://api.buffer.com";
 
-const CREATE_POST = `
-mutation CreatePost($text: String!, $channelId: ChannelId!, $assets: [AssetInput!]) {
+/**
+ * createPost の mutation を組み立てる。
+ * Buffer は `assets: null` を受け付けない（「Argument "input" has invalid value」になる）ため、
+ * 画像がないときは assets を変数ごと含めない。
+ */
+export function createPostMutation(withAssets: boolean): string {
+  const assetsVar = withAssets ? ", $assets: [AssetInput!]!" : "";
+  const assetsField = withAssets ? "\n    assets: $assets" : "";
+  return `
+mutation CreatePost($text: String!, $channelId: ChannelId!${assetsVar}) {
   createPost(input: {
     text: $text
     channelId: $channelId
     schedulingType: automatic
-    mode: shareNow
-    assets: $assets
+    mode: shareNow${assetsField}
   }) {
     ... on PostActionSuccess { post { id } }
     ... on MutationError { message }
   }
 }`;
+}
 
 interface GraphQLResponse {
   data?: {
@@ -41,6 +49,7 @@ export class BufferPoster implements Poster {
 
   async post(post: OutgoingPost): Promise<PostResult> {
     const assets = post.imageUrls.map((url) => ({ image: { url } }));
+    const withAssets = assets.length > 0;
     const res = await this.fetcher(BUFFER_API_URL, {
       method: "POST",
       headers: {
@@ -48,11 +57,11 @@ export class BufferPoster implements Poster {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        query: CREATE_POST,
+        query: createPostMutation(withAssets),
         variables: {
           text: post.text,
           channelId: this.channelId,
-          assets: assets.length > 0 ? assets : null,
+          ...(withAssets ? { assets } : {}),
         },
       }),
     });

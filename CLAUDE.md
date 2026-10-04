@@ -71,7 +71,8 @@ src/index.ts::handleRequest(request, env, fetcher?)
   - 転送しないノート → 200（`skipped`）
   - 投稿先が投稿を拒否（GraphQL の `MutationError`、4xx）→ 422（再送しても無駄なので再送させない）
   - 投稿先の一時的な障害（5xx、429、通信エラー）→ 502（再送させる）
-- Buffer の GraphQL の型名は実際の API で確認済み: `ChannelId`、`AssetInput`、`mode: shareNow`。画像は `assets: [{ image: { url } }]`（2026 年 5 月の仕様変更後の配列形式）
+- Buffer の GraphQL: `ChannelId` と `mode: shareNow` は実際の API で確認済み。画像は `assets: [{ image: { url } }]`（2026 年 5 月の仕様変更後の配列形式、型名は `AssetInput`）
+- Buffer は `assets: null` を受け付けず「Argument "input" has invalid value」を返す。画像がないときは `createPostMutation(false)` で assets を変数ごと含めない
 - Buffer API キーの権限は `posts:write` だけで足りる。チャンネル ID は Web 画面の URL から取得する（API で取得するには `account:read` などの追加権限が要る）
 - メンションの無害化は `@` の直後にゼロ幅スペース（U+200B）を挟む方式。全角の `＠` は X でもメンションとして扱われるため使わない
 - 文字数カウントは Buffer の作成画面の残り文字数表示（「てすとなう」で残り 270）と一致することを確認済み
