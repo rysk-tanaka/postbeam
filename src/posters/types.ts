@@ -5,9 +5,14 @@ export interface PostResult {
   id: string;
 }
 
+export interface PostOptions {
+  /** 投稿先との通信の上限。Misskey の再送と記録の有無で決まるため、呼び出し側が渡す */
+  timeoutMs: number;
+}
+
 export interface Poster {
   readonly name: string;
-  post(post: OutgoingPost): Promise<PostResult>;
+  post(post: OutgoingPost, options: PostOptions): Promise<PostResult>;
 }
 
 /**
@@ -26,8 +31,10 @@ export class PosterError extends Error {
     readonly kind: PosterErrorKind,
     readonly status?: number,
     readonly detail?: unknown,
+    // 包んだ元の例外。ログにスタックトレースを残すため
+    cause?: unknown,
   ) {
-    super(message);
+    super(message, { cause });
     this.name = "PosterError";
   }
 }

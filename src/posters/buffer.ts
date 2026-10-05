@@ -1,11 +1,11 @@
 import type { OutgoingPost } from "../transform";
-import { globalFetch, sendRequest } from "./fetch";
+import { globalFetch, requestJson } from "./fetch";
 import {
   describeErrors,
-  kindFromResponse,
   kindFromStatus,
   type Poster,
   PosterError,
+  type PostOptions,
   type PostResult,
 } from "./types";
 
@@ -55,35 +55,29 @@ export class BufferPoster implements Poster {
     private readonly fetcher: typeof fetch = globalFetch,
   ) {}
 
-  async post(post: OutgoingPost): Promise<PostResult> {
+  async post(post: OutgoingPost, options: PostOptions): Promise<PostResult> {
     const assets = post.imageUrls.map((url) => ({ image: { url } }));
     const withAssets = assets.length > 0;
-    const res = await sendRequest(this.fetcher, BUFFER_API_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        query: createPostMutation(withAssets),
-        variables: {
-          text: post.text,
-          channelId: this.channelId,
-          ...(withAssets ? { assets } : {}),
+    const { res, body: parsed } = await requestJson(this.fetcher, {
+      label: "Buffer",
+      url: BUFFER_API_URL,
+      init: {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          "Content-Type": "application/json",
         },
-      }),
+        body: JSON.stringify({
+          query: createPostMutation(withAssets),
+          variables: {
+            text: post.text,
+            channelId: this.channelId,
+            ...(withAssets ? { assets } : {}),
+          },
+        }),
+      },
+      timeoutMs: options.timeoutMs,
     });
-
-    let parsed: unknown;
-    try {
-      parsed = await res.json();
-    } catch {
-      throw new PosterError(
-        `Buffer returned non-JSON (${res.status})`,
-        kindFromResponse(res),
-        res.status,
-      );
-    }
     const json: GraphQLResponse =
       typeof parsed === "object" && parsed !== null ? parsed : {};
 

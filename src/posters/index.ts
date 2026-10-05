@@ -3,7 +3,7 @@ import { BufferPoster } from "./buffer";
 import type { Poster } from "./types";
 import { XPoster } from "./x";
 
-export type { Poster, PostResult } from "./types";
+export type { Poster, PostOptions, PostResult } from "./types";
 export { PosterError, type PosterErrorKind } from "./types";
 
 /** Env のうち、値が文字列のもの（シークレットと設定値）の名前 */

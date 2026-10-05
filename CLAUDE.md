@@ -45,7 +45,7 @@ pnpm run deploy
 ## アーキテクチャ
 
 ```text
-src/index.ts::handleRequest(request, env, fetcher?)
+src/index.ts::handleRequest(request, env, ctx, fetcher?)
   → POST 以外は 405
   → X-Misskey-Hook-Secret を timingSafeEqual で検証（不一致は 401）
   → payload.type が "note" 以外はスキップ
@@ -55,8 +55,11 @@ src/index.ts::handleRequest(request, env, fetcher?)
   → buildPost(note, config, link) で本文と画像 URL を組み立てる
   → createPoster(env, config)
   → DeliveryLog（KV）に記録のあるノートはスキップし、なければ記録する（KV がない・障害時は確認しない）
-  → poster.post(post)。再送で投稿し直せる失敗（unavailable）のときだけ記録を消す
+  → 受信からの経過で投稿先の上限（timeoutMs）を決める。記録がなく残りが 1 秒未満なら、投稿せずに unavailable
+  → poster.post(post, { timeoutMs })。再送で投稿し直せる失敗（unavailable）で、記録を書き込んだか書き込みを試みた（claimed / claim-failed）ときだけ、削除を ctx.waitUntil に登録し、完了を待たずに応答する
 ```
+
+Worker の `fetch` は、`handleRequest` の処理全体を `ctx.waitUntil` にも登録する。Misskey が 5 秒で切断しても、最大 30 秒は記録・投稿・ログを続ける。
 
 - `src/config.ts` — `Env`（シークレットと [vars]）の型と `loadConfig()`。不正な値は `ConfigError` を投げる
 - `src/misskey.ts` — Misskey の webhook payload とノートの型（必要な項目のみ）
@@ -73,11 +76,14 @@ src/index.ts::handleRequest(request, env, fetcher?)
 - レスポンスコードは Misskey の再送挙動に合わせている。Misskey は 5xx と無応答のときだけ再送する
   - 転送しないノート、KV に記録のあるノート → 200（`skipped`）
   - `rejected`（4xx、GraphQL の `MutationError`、X で本文が空）→ 422。再送しても無駄なので再送させず、記録も消さない
-  - `unavailable`（408、425、429、503、521〜523）→ 502。記録を消すので、再送で投稿し直す。記録を書き込めていて消せなかったときは再送が重複として捨てられるため、`rejected` に変えて 422 にする。記録の書き込みに失敗していたときは、記録はおそらくないので 502 のまま
-  - `unknown`（通信エラー、それ以外の 5xx、2xx で投稿 ID がない、投稿中の想定外の例外）→ 422。記録を残し、再送させない。二重投稿より取りこぼしを選ぶ方針で、KV がなくても同じ
+  - `unavailable`（408、425、429、503、521〜523）→ 502。記録を消すので、再送で投稿し直す。削除は応答の後も続けるため、消せなかったときはステータスを変えられない。再送は重複としてスキップされ、取りこぼす。ログの `failed to release claim` で追える。記録の書き込みに失敗していた（`claim-failed`）ときは、記録はおそらくないので、再送で投稿し直されうる（ログの `retries` が `may-repost`）
+  - `unknown`（通信エラー、投稿先がステータスを返す前のタイムアウト、それ以外の 5xx、2xx で投稿 ID がない、投稿中の想定外の例外）→ 422。記録を残し、再送させない。二重投稿より取りこぼしを選ぶ方針で、KV がなくても同じ。投稿に 5 秒以上かかると Misskey は 422 を受け取る前に切断して再送するが、その再送は記録で重複としてスキップされる。本文の受信中に途切れたときは、受け取ったステータスで分類する
 - Buffer の応答は、投稿 ID があれば `errors` が混じっていても成功とみなす。2xx の応答で `data` キーのない `errors` は実行前のエラーなので `rejected`。2xx 以外は `MutationError` があってもステータスで分類する
-- KV が使えないときも、転送を止めないよう投稿を続ける。障害で記録を確認できないときは重複を確認せずに投稿し（`unchecked`）、無料枠の書き込み上限などで記録だけを書けないときは記録のないまま投稿する（`claim-failed`）。その再送は重複として防げない
-- KV は同じキーへの書き込みが 1 秒に 1 回まで。記録の直後に消すことがあるため、削除は失敗したら間を空けて再試行する
+- KV が使えないときも、転送を止めないよう投稿を続ける。障害で記録を確認できないときは重複を確認せずに投稿し（`unchecked`）、無料枠の書き込み上限などで記録だけを書けないときは記録のないまま投稿する（`claim-failed`）。その再送は重複として防げない。KV の読み書きは 1 秒で打ち切り、遅いときも記録なしとして進む（遅い KV に Misskey の 5 秒を使い切られないようにするため）
+- KV は同じキーへの書き込みが 1 秒に 1 回まで。記録の直後に消すことがあるため、削除は記録の書き込みが終わってから 1 秒以上たつまで待ってから行い、失敗したら間を空けて再試行する。どちらも応答を待たせずに続ける。1 秒で打ち切った書き込みも裏で続くため、その完了も待つ（削除の後に届くと記録が作り直され、再送がスキップされる）。削除は 2 秒で打ち切り、waitUntil の猶予の中で失敗をログに残せるようにする
+- 投稿先との通信の上限は、記録の有無で変え、webhook の受信から数える（KV の操作が遅れたぶんも含める）。Misskey は 5 秒で切断して再送するが、処理は waitUntil で続く
+  - 記録があるとき（`claimed`）は 20 秒（`CLAIMED_BUDGET_MS`）。再送は重複としてスキップされるので、遅れて届く 503 などの確定した応答を待つ。waitUntil の 30 秒の猶予の中で、記録の削除の時間を残す。期限を過ぎていても最低 1 秒は投稿を試みる。Misskey の再送が 60 秒以上あとに来ることが前提で、それより早い再送は、削除が間に合わず重複としてスキップされうる
+  - 記録がないとき（KV なし、`unchecked`、`claim-failed`）は 4 秒（`UNCLAIMED_BUDGET_MS`）。再送を防げないため、5 秒の切断の前に打ち切って二重投稿を避ける。残りが 1 秒を切っていたら投稿せず、`unavailable`（502）にして再送に任せる
 - `findUrls` は X（twitter-text）が確実に URL とみなす範囲だけを返す。英数字の直後や一覧（`GENERIC_TLDS`）にも英字 2 文字にも当てはまらない TLD のホストは URL にせず、パスとクエリは ASCII だけにし、対応の取れない括弧の手前で打ち切る。URL を広く取るとその中のメンションが無害化されずに別人へ通知が飛ぶため、ずれるなら狭い側に倒す。URL の外側だけを置換する処理と文字数のカウントの両方がこれに依存する。2 文字の TLD は実在するかを確認しないため、この部分だけは X より広い
 - Buffer の GraphQL: `ChannelId` と `mode: shareNow` は実際の API で確認済み。画像は `assets: [{ image: { url } }]`（2026 年 5 月の仕様変更後の配列形式、型名は `AssetInput`）
 - Buffer は `assets: null` を受け付けず「Argument "input" has invalid value」を返す。画像がないときは `createPostMutation(false)` で assets を変数ごと含めない

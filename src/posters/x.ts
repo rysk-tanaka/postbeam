@@ -1,11 +1,12 @@
 import { type OAuth1Credentials, signOAuth1 } from "../oauth1";
 import type { OutgoingPost } from "../transform";
-import { globalFetch, sendRequest } from "./fetch";
+import { globalFetch, requestJson } from "./fetch";
 import {
   describeErrors,
   kindFromResponse,
   type Poster,
   PosterError,
+  type PostOptions,
   type PostResult,
 } from "./types";
 
@@ -33,7 +34,7 @@ export class XPoster implements Poster {
     private readonly fetcher: typeof fetch = globalFetch,
   ) {}
 
-  async post(post: OutgoingPost): Promise<PostResult> {
+  async post(post: OutgoingPost, options: PostOptions): Promise<PostResult> {
     if (post.imageUrls.length > 0) {
       console.warn(
         JSON.stringify({
@@ -51,22 +52,16 @@ export class XPoster implements Poster {
       method: "POST",
       url: X_CREATE_POST_URL,
     });
-    const res = await sendRequest(this.fetcher, X_CREATE_POST_URL, {
-      method: "POST",
-      headers: { Authorization: header, "Content-Type": "application/json" },
-      body: JSON.stringify({ text: post.text }),
+    const { res, body: parsed } = await requestJson(this.fetcher, {
+      label: "X",
+      url: X_CREATE_POST_URL,
+      init: {
+        method: "POST",
+        headers: { Authorization: header, "Content-Type": "application/json" },
+        body: JSON.stringify({ text: post.text }),
+      },
+      timeoutMs: options.timeoutMs,
     });
-
-    let parsed: unknown;
-    try {
-      parsed = await res.json();
-    } catch {
-      throw new PosterError(
-        `X returned non-JSON (${res.status})`,
-        kindFromResponse(res),
-        res.status,
-      );
-    }
     const json: XCreateResponse =
       typeof parsed === "object" && parsed !== null ? parsed : {};
     if (res.ok && json.data?.id) return { id: json.data.id };
