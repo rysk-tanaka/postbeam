@@ -4,14 +4,31 @@ import type { Poster } from "./types";
 import { XPoster } from "./x";
 
 export type { Poster, PostResult } from "./types";
-export { PosterError } from "./types";
+export { PosterError, type PosterErrorKind } from "./types";
 
-function required(env: Env, names: (keyof Env)[]): string[] {
-  const missing = names.filter((n) => !env[n]);
+/** Env のうち、値が文字列のもの（シークレットと設定値）の名前 */
+type SecretName = {
+  [K in keyof Env]-?: Env[K] extends string | undefined ? K : never;
+}[keyof Env];
+
+function requireSecrets<K extends SecretName>(
+  env: Env,
+  names: readonly K[],
+): Record<K, string> {
+  const secrets = {} as Record<K, string>;
+  const missing: K[] = [];
+  for (const name of names) {
+    const value: string | undefined = env[name];
+    if (value) {
+      secrets[name] = value;
+    } else {
+      missing.push(name);
+    }
+  }
   if (missing.length > 0) {
     throw new ConfigError(`missing secrets: ${missing.join(", ")}`);
   }
-  return names.map((n) => env[n] as string);
+  return secrets;
 }
 
 export function createPoster(
@@ -21,14 +38,11 @@ export function createPoster(
 ): Poster {
   switch (config.poster) {
     case "buffer": {
-      const [apiKey, channelId] = required(env, [
-        "BUFFER_API_KEY",
-        "BUFFER_CHANNEL_ID",
-      ]);
-      return new BufferPoster(apiKey as string, channelId as string, fetcher);
+      const s = requireSecrets(env, ["BUFFER_API_KEY", "BUFFER_CHANNEL_ID"]);
+      return new BufferPoster(s.BUFFER_API_KEY, s.BUFFER_CHANNEL_ID, fetcher);
     }
     case "x": {
-      const [consumerKey, consumerSecret, token, tokenSecret] = required(env, [
+      const s = requireSecrets(env, [
         "X_API_KEY",
         "X_API_SECRET",
         "X_ACCESS_TOKEN",
@@ -36,10 +50,10 @@ export function createPoster(
       ]);
       return new XPoster(
         {
-          consumerKey: consumerKey as string,
-          consumerSecret: consumerSecret as string,
-          token: token as string,
-          tokenSecret: tokenSecret as string,
+          consumerKey: s.X_API_KEY,
+          consumerSecret: s.X_API_SECRET,
+          token: s.X_ACCESS_TOKEN,
+          tokenSecret: s.X_ACCESS_SECRET,
         },
         fetcher,
       );
