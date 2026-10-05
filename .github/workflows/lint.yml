@@ -14,9 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # バージョンは pnpm-lock.yaml から自動検出させ、package.json との二重管理を避ける
       - uses: biomejs/setup-biome@4c91541eaada48f67d7dbd7833600ce162b68f51 # v2.7.1
-        with:
-          version: "2.5.15"
       - run: biome check .
 
   lint-md:

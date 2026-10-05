@@ -1,7 +1,13 @@
 import { type OAuth1Credentials, signOAuth1 } from "../oauth1";
 import type { OutgoingPost } from "../transform";
-import { globalFetch } from "./fetch";
-import { type Poster, PosterError, type PostResult } from "./types";
+import { globalFetch, sendRequest } from "./fetch";
+import {
+  describeErrors,
+  kindFromResponse,
+  type Poster,
+  PosterError,
+  type PostResult,
+} from "./types";
 
 export const X_CREATE_POST_URL = "https://api.x.com/2/tweets";
 
@@ -9,7 +15,8 @@ interface XCreateResponse {
   data?: { id: string; text: string };
   title?: string;
   detail?: string;
-  errors?: { message: string }[];
+  // 配列のはずだが、ゲートウェイなどが別の形式で返すこともある
+  errors?: unknown;
 }
 
 /**
@@ -36,26 +43,40 @@ export class XPoster implements Poster {
         }),
       );
     }
-    if (!post.text) throw new PosterError("X requires text when no media");
+    if (!post.text) {
+      throw new PosterError("X requires text when no media", "rejected");
+    }
 
     const { header } = await signOAuth1(this.creds, {
       method: "POST",
       url: X_CREATE_POST_URL,
     });
-    const res = await this.fetcher(X_CREATE_POST_URL, {
+    const res = await sendRequest(this.fetcher, X_CREATE_POST_URL, {
       method: "POST",
       headers: { Authorization: header, "Content-Type": "application/json" },
       body: JSON.stringify({ text: post.text }),
     });
 
-    const json = (await res.json().catch(() => ({}))) as XCreateResponse;
+    let parsed: unknown;
+    try {
+      parsed = await res.json();
+    } catch {
+      throw new PosterError(
+        `X returned non-JSON (${res.status})`,
+        kindFromResponse(res),
+        res.status,
+      );
+    }
+    const json: XCreateResponse =
+      typeof parsed === "object" && parsed !== null ? parsed : {};
     if (res.ok && json.data?.id) return { id: json.data.id };
     const msg =
       json.detail ??
       json.title ??
-      json.errors?.map((e) => e.message).join("; ");
+      (describeErrors(json.errors) || "no post id in response");
     throw new PosterError(
-      `X API error (${res.status}): ${msg ?? ""}`,
+      `X API error (${res.status}): ${msg}`,
+      kindFromResponse(res),
       res.status,
       json,
     );

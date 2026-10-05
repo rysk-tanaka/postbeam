@@ -1,6 +1,13 @@
 import type { OutgoingPost } from "../transform";
-import { globalFetch } from "./fetch";
-import { type Poster, PosterError, type PostResult } from "./types";
+import { globalFetch, sendRequest } from "./fetch";
+import {
+  describeErrors,
+  kindFromResponse,
+  kindFromStatus,
+  type Poster,
+  PosterError,
+  type PostResult,
+} from "./types";
 
 export const BUFFER_API_URL = "https://api.buffer.com";
 
@@ -30,7 +37,8 @@ interface GraphQLResponse {
   data?: {
     createPost?: { post?: { id: string }; message?: string } | null;
   } | null;
-  errors?: { message: string }[];
+  // 配列のはずだが、ゲートウェイなどが別の形式で返すこともある
+  errors?: unknown;
 }
 
 /**
@@ -50,7 +58,7 @@ export class BufferPoster implements Poster {
   async post(post: OutgoingPost): Promise<PostResult> {
     const assets = post.imageUrls.map((url) => ({ image: { url } }));
     const withAssets = assets.length > 0;
-    const res = await this.fetcher(BUFFER_API_URL, {
+    const res = await sendRequest(this.fetcher, BUFFER_API_URL, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${this.apiKey}`,
@@ -66,28 +74,61 @@ export class BufferPoster implements Poster {
       }),
     });
 
-    let json: GraphQLResponse;
+    let parsed: unknown;
     try {
-      json = (await res.json()) as GraphQLResponse;
+      parsed = await res.json();
     } catch {
       throw new PosterError(
         `Buffer returned non-JSON (${res.status})`,
+        kindFromResponse(res),
         res.status,
       );
     }
+    const json: GraphQLResponse =
+      typeof parsed === "object" && parsed !== null ? parsed : {};
 
-    if (!res.ok || json.errors?.length) {
-      const msg = json.errors?.map((e) => e.message).join("; ") ?? "";
+    // 投稿 ID が返っていれば、errors が混じっていても投稿は済んでいる
+    const result = json.data?.createPost;
+    if (result?.post?.id) {
+      // 投稿は済んでいるが、画像が付かなかったなどの劣化を後から追えるようにする
+      const partialErrors = describeErrors(json.errors);
+      if (partialErrors) {
+        console.warn(
+          JSON.stringify({
+            level: "warn",
+            msg: "buffer returned errors with post id",
+            postId: result.post.id,
+            errors: partialErrors,
+          }),
+        );
+      }
+      return { id: result.post.id };
+    }
+
+    const msg = describeErrors(json.errors) || String(result?.message ?? "");
+    // 429 や 503 と一緒に MutationError が返っても、一時的な失敗として再送させる
+    if (!res.ok) {
       throw new PosterError(
         `Buffer API error (${res.status}): ${msg}`,
+        kindFromStatus(res.status),
         res.status,
         json,
       );
     }
-    const result = json.data?.createPost;
-    if (result?.post?.id) return { id: result.post.id };
+    if (result?.message) {
+      throw new PosterError(
+        `Buffer rejected the post: ${result.message}`,
+        "rejected",
+        res.status,
+        json,
+      );
+    }
+    // GraphQL では、構文や検証のエラーで実行前に失敗した応答は data を含まない
+    const isRequestError =
+      Array.isArray(json.errors) && json.errors.length > 0 && !("data" in json);
     throw new PosterError(
-      `Buffer rejected the post: ${result?.message ?? "unknown error"}`,
+      `Buffer API error (${res.status}): ${msg || "no post id"}`,
+      isRequestError ? "rejected" : "unknown",
       res.status,
       json,
     );

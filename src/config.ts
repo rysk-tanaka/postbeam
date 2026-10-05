@@ -19,6 +19,10 @@ export interface Env {
   STRIP_CUSTOM_EMOJI?: string;
   /** webhook の payload に server が含まれない古い Misskey 向け */
   MISSKEY_URL?: string;
+
+  // バインディング
+  /** 転送済みのノートの記録。なければ重複投稿の防止をしない */
+  POSTED_NOTES?: KVNamespace;
 }
 
 export type PosterKind = "buffer" | "x";
@@ -48,9 +52,23 @@ function parseList(value: string | undefined, fallback: string): Set<string> {
   );
 }
 
-function parseBool(value: string | undefined, fallback: boolean): boolean {
-  if (value === undefined || value === "") return fallback;
-  return ["true", "1", "yes"].includes(value.trim().toLowerCase());
+const KNOWN_VISIBILITIES = ["public", "home", "followers", "specified"];
+const TRUE_VALUES = ["true", "1", "yes"];
+const FALSE_VALUES = ["false", "0", "no"];
+
+function parseBool(
+  name: string,
+  value: string | undefined,
+  fallback: boolean,
+): boolean {
+  const v = value?.trim().toLowerCase();
+  if (!v) return fallback;
+  if (TRUE_VALUES.includes(v)) return true;
+  if (FALSE_VALUES.includes(v)) return false;
+  // 誤記をそのまま false として扱うと、設定ミスに気づけない
+  throw new ConfigError(
+    `${name} must be one of: ${[...TRUE_VALUES, ...FALSE_VALUES].join(", ")}`,
+  );
 }
 
 function parseEnum<T extends string>(
@@ -59,18 +77,32 @@ function parseEnum<T extends string>(
   allowed: readonly T[],
   fallback: T,
 ): T {
-  if (value === undefined || value === "") return fallback;
-  const v = value.trim().toLowerCase();
+  const v = value?.trim().toLowerCase();
+  if (!v) return fallback;
   if ((allowed as readonly string[]).includes(v)) return v as T;
   throw new ConfigError(`${name} must be one of: ${allowed.join(", ")}`);
 }
 
 export function loadConfig(env: Env): Config {
+  const visibilities = parseList(env.VISIBILITIES, "public,home");
+  // 空だとすべてのノートがエラーもなくスキップされるため、設定ミスとして扱う
+  if (visibilities.size === 0) {
+    throw new ConfigError("VISIBILITIES must not be empty");
+  }
+  // 誤記（pubic など）も、一致するノートがないまま気づかれずにスキップされ続けるため
+  const unknownVisibilities = [...visibilities].filter(
+    (v) => !KNOWN_VISIBILITIES.includes(v),
+  );
+  if (unknownVisibilities.length > 0) {
+    throw new ConfigError(
+      `VISIBILITIES has unknown values: ${unknownVisibilities.join(", ")} (allowed: ${KNOWN_VISIBILITIES.join(", ")})`,
+    );
+  }
   return {
     poster: parseEnum("POSTER", env.POSTER, ["buffer", "x"], "buffer"),
-    visibilities: parseList(env.VISIBILITIES, "public,home"),
+    visibilities,
     cwMode: parseEnum("CW_MODE", env.CW_MODE, ["skip", "include"], "skip"),
-    includeReplies: parseBool(env.INCLUDE_REPLIES, false),
+    includeReplies: parseBool("INCLUDE_REPLIES", env.INCLUDE_REPLIES, false),
     excludeTags: parseList(env.EXCLUDE_TAGS, "nox"),
     appendLink: parseEnum(
       "APPEND_LINK",
@@ -78,8 +110,12 @@ export function loadConfig(env: Env): Config {
       ["never", "truncated", "always"],
       "never",
     ),
-    attachSensitive: parseBool(env.ATTACH_SENSITIVE, false),
-    stripCustomEmoji: parseBool(env.STRIP_CUSTOM_EMOJI, true),
+    attachSensitive: parseBool("ATTACH_SENSITIVE", env.ATTACH_SENSITIVE, false),
+    stripCustomEmoji: parseBool(
+      "STRIP_CUSTOM_EMOJI",
+      env.STRIP_CUSTOM_EMOJI,
+      true,
+    ),
     misskeyUrl: env.MISSKEY_URL?.replace(/\/+$/, "") || undefined,
   };
 }

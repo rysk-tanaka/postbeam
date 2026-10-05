@@ -5,6 +5,11 @@ compatibility_date = "2026-09-01"
 [observability]
 enabled = true
 
+# 転送したノートの記録。重複投稿の防止に使い、削除すると記録せずに動く
+[[kv_namespaces]]
+binding = "POSTED_NOTES"
+id = "af3b874810a34f479bcc4f002aebc981"
+
 # 秘密情報は `wrangler secret put <NAME>` で登録する（README の「シークレット」を参照）
 # MISSKEY_HOOK_SECRET / BUFFER_API_KEY / BUFFER_CHANNEL_ID
 # X_API_KEY / X_API_SECRET / X_ACCESS_TOKEN / X_ACCESS_SECRET
