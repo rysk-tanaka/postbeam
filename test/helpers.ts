@@ -1,3 +1,4 @@
+import { vi } from "vitest";
 import { type Config, loadConfig } from "../src/config";
 import type { MisskeyNote, MisskeyWebhookPayload } from "../src/misskey";
 
@@ -101,6 +102,34 @@ export function createMemoryKv(initial: Record<string, string> = {}): MemoryKv {
     ttls,
     fail(method, { keyPrefix = "", times = Number.POSITIVE_INFINITY } = {}) {
       failures.push({ method, keyPrefix, remaining: times });
+    },
+  };
+}
+
+export interface TestContext {
+  ctx: Pick<ExecutionContext, "waitUntil">;
+  waitUntil: ReturnType<typeof vi.fn<(promise: Promise<unknown>) => void>>;
+  /** waitUntil に渡された処理がすべて終わるのを待つ */
+  settle(): Promise<void>;
+}
+
+/** waitUntil に渡された Promise を集める ExecutionContext */
+export function createContext(): TestContext {
+  const pending: Promise<unknown>[] = [];
+  const waitUntil = vi.fn((promise: Promise<unknown>) => {
+    pending.push(promise);
+  });
+  return {
+    ctx: { waitUntil },
+    waitUntil,
+    async settle() {
+      // 待っている間に登録された処理も待つ
+      let settled = 0;
+      while (settled < pending.length) {
+        const count = pending.length;
+        await Promise.allSettled(pending);
+        settled = count;
+      }
     },
   };
 }

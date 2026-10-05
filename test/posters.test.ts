@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { BufferPoster } from "../src/posters/buffer";
-import { kindFromStatus, type Poster, PosterError } from "../src/posters/types";
+import { truncate } from "../src/posters/fetch";
+import {
+  kindFromStatus,
+  type Poster,
+  PosterError,
+  type PostOptions,
+} from "../src/posters/types";
 import { XPoster } from "../src/posters/x";
 import type { OutgoingPost } from "../src/transform";
 
@@ -35,7 +41,7 @@ describe("既定の fetch の呼び出し方", () => {
     );
     const poster = new BufferPoster("key", "ch");
     await expect(
-      poster.post({ text: "t", imageUrls: [], truncated: false }),
+      poster.post({ text: "t", imageUrls: [], truncated: false }, options),
     ).resolves.toEqual({ id: "b" });
   });
 
@@ -48,12 +54,13 @@ describe("既定の fetch の呼び出し方", () => {
       tokenSecret: "d",
     });
     await expect(
-      poster.post({ text: "t", imageUrls: [], truncated: false }),
+      poster.post({ text: "t", imageUrls: [], truncated: false }, options),
     ).resolves.toEqual({ id: "x" });
   });
 });
 
 const textPost: OutgoingPost = { text: "t", imageUrls: [], truncated: false };
+const options: PostOptions = { timeoutMs: 4000 };
 
 function respond(status: number, body: unknown): typeof fetch {
   const raw = typeof body === "string" ? body : JSON.stringify(body);
@@ -71,14 +78,23 @@ function xPoster(fetcher: typeof fetch) {
   );
 }
 
-/** 投稿が失敗したときの kind を返す */
-async function failureKind(poster: Poster, post = textPost) {
-  const err = await poster.post(post).then(
+/** 投稿が失敗したときの PosterError を返す */
+async function failure(
+  poster: Poster,
+  post = textPost,
+  postOptions = options,
+): Promise<PosterError> {
+  const err = await poster.post(post, postOptions).then(
     () => undefined,
     (e: unknown) => e,
   );
   expect(err).toBeInstanceOf(PosterError);
-  return (err as PosterError).kind;
+  return err as PosterError;
+}
+
+/** 投稿が失敗したときの kind を返す */
+async function failureKind(poster: Poster, post = textPost) {
+  return (await failure(poster, post)).kind;
 }
 
 describe("kindFromStatus", () => {
@@ -110,7 +126,9 @@ describe("BufferPoster のエラー分類", () => {
         errors: [{ message: "partial" }],
       }),
     );
-    await expect(poster.post(textPost)).resolves.toEqual({ id: "b" });
+    await expect(poster.post(textPost, options)).resolves.toEqual({
+      id: "b",
+    });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("partial"));
   });
 
@@ -204,17 +222,189 @@ describe("XPoster のエラー分類", () => {
     expect(await failureKind(xPoster(respond(status, body)))).toBe(kind);
   });
 
-  test("非 JSON の応答は、そのことがメッセージでわかる", async () => {
-    const poster = xPoster(respond(502, "<html>Bad Gateway</html>"));
-    await expect(poster.post(textPost)).rejects.toThrow(
-      "X returned non-JSON (502)",
-    );
-  });
-
   test("通信エラーは unknown", async () => {
     const poster = xPoster(async () => {
       throw new TypeError("network connection lost");
     });
     expect(await failureKind(poster)).toBe("unknown");
+  });
+});
+
+describe("投稿先との通信", () => {
+  const posters = [
+    ["Buffer", bufferPoster],
+    ["X", xPoster],
+  ] as const;
+
+  /** signal が abort されるまで応答しない fetcher */
+  function hangingFetch() {
+    return vi.fn<typeof fetch>(
+      (_, init) =>
+        new Promise((_, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(init.signal?.reason),
+          );
+        }),
+    );
+  }
+
+  /** ヘッダーの後、本文の受信中に途切れる応答 */
+  function brokenBodyFetch(status: number): typeof fetch {
+    return async () =>
+      new Response(
+        new ReadableStream({
+          pull(controller) {
+            controller.error(new TypeError("stream interrupted"));
+          },
+        }),
+        { status },
+      );
+  }
+
+  test.each(posters)(
+    "%s は応答がなければ指定された上限で打ち切り、unknown にする",
+    async (_, makePoster) => {
+      // Node の AbortSignal.timeout は fake timers で進まないため、手で abort する
+      const controller = new AbortController();
+      const timeout = vi
+        .spyOn(AbortSignal, "timeout")
+        .mockReturnValue(controller.signal);
+      const fetcher = hangingFetch();
+      const pending = failure(makePoster(fetcher));
+      await vi.waitFor(() => expect(fetcher).toHaveBeenCalled());
+      expect(timeout).toHaveBeenCalledWith(options.timeoutMs);
+      expect(fetcher.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
+
+      controller.abort(new DOMException("timed out", "TimeoutError"));
+      const err = await pending;
+      expect(err).toBeInstanceOf(PosterError);
+      expect(err.kind).toBe("unknown");
+      expect(err.message).toBe("request timed out after 4000ms");
+    },
+  );
+
+  test.each(posters)(
+    "%s は、指定されたタイムアウトで打ち切る",
+    async (_, makePoster) => {
+      const controller = new AbortController();
+      const timeout = vi
+        .spyOn(AbortSignal, "timeout")
+        .mockReturnValue(controller.signal);
+      const fetcher = hangingFetch();
+      const pending = failure(makePoster(fetcher), textPost, {
+        timeoutMs: 20_000,
+      });
+      await vi.waitFor(() => expect(fetcher).toHaveBeenCalled());
+      expect(timeout).toHaveBeenCalledWith(20_000);
+      controller.abort(new DOMException("timed out", "TimeoutError"));
+      expect((await pending).message).toBe("request timed out after 20000ms");
+    },
+  );
+
+  test.each([4000, 20_000])(
+    "本文の受信中のタイムアウトは、上限 %i ms とともにメッセージに出す",
+    async (timeoutMs) => {
+      const poster = bufferPoster(
+        async () =>
+          new Response(
+            new ReadableStream({
+              pull(controller) {
+                controller.error(new DOMException("timed out", "TimeoutError"));
+              },
+            }),
+            { status: 200 },
+          ),
+      );
+      const err = await failure(poster, textPost, { timeoutMs });
+      expect(err.message).toBe(
+        `Buffer response body could not be read (200): timed out after ${timeoutMs}ms`,
+      );
+    },
+  );
+
+  test.each([
+    ["Buffer", 200, "unknown", bufferPoster],
+    ["Buffer", 503, "unavailable", bufferPoster],
+    ["X", 200, "unknown", xPoster],
+    ["X", 503, "unavailable", xPoster],
+  ] as const)(
+    "%s で本文の受信中に途切れたら、ステータス %i から %s にする",
+    async (label, status, kind, makePoster) => {
+      const poster = makePoster(brokenBodyFetch(status));
+      const err = await failure(poster);
+      expect(err.kind).toBe(kind);
+      // 途切れた原因を、メッセージとログのスタックトレースで追えるようにする
+      expect(err.message).toBe(
+        `${label} response body could not be read (${status}): TypeError: stream interrupted`,
+      );
+      expect((err.cause as Error).message).toBe("stream interrupted");
+    },
+  );
+
+  test.each(posters)(
+    "%s の非 JSON の応答は、そのことがメッセージでわかり、本文の先頭を detail に残す",
+    async (label, makePoster) => {
+      const poster = makePoster(respond(502, "<html>Bad Gateway</html>"));
+      const err = await failure(poster);
+      expect(err.message).toBe(`${label} returned non-JSON (502)`);
+      expect(err.detail).toEqual({
+        bodySnippet: "<html>Bad Gateway</html>",
+      });
+    },
+  );
+
+  test("非 JSON の本文は、先頭の 500 文字だけを残す", async () => {
+    const poster = xPoster(respond(502, "x".repeat(600)));
+    const err = await failure(poster);
+    expect(err.detail).toEqual({
+      bodySnippet: `${"x".repeat(500)}…`,
+    });
+  });
+
+  test.each([
+    ["通信エラー", new TypeError("network connection lost")],
+    ["タイムアウト以外の中断", new DOMException("aborted", "AbortError")],
+  ])("%s は、タイムアウトと区別できるメッセージにする", async (_, thrown) => {
+    const poster = bufferPoster(async () => {
+      throw thrown;
+    });
+    const err = await failure(poster);
+    expect(err.message).toBe(`request failed: ${String(thrown)}`);
+  });
+
+  test("通信エラーは、元の例外を cause に持つ", async () => {
+    const original = new TypeError("network connection lost");
+    const poster = bufferPoster(async () => {
+      throw original;
+    });
+    const err = await failure(poster);
+    expect(err.cause).toBe(original);
+  });
+});
+
+describe("投稿先の上限の値", () => {
+  test("不正な上限は、送る前の失敗として通信エラー（unknown）と区別する", async () => {
+    const fetcher = vi.fn(
+      respond(200, { data: { createPost: { post: { id: "b" } } } }),
+    );
+    const poster = bufferPoster(fetcher);
+    const err = await poster.post(textPost, { timeoutMs: -1 }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).not.toBeInstanceOf(PosterError);
+    expect(err).toBeInstanceOf(RangeError);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+});
+
+describe("truncate", () => {
+  test.each([
+    ["上限以内はそのまま", "abc", 3, "abc"],
+    ["上限を超えたら … を付ける", "abcd", 3, "abc…"],
+    ["絵文字の途中では切らない", "a😀b", 2, "a…"],
+    ["絵文字の直後なら絵文字を残す", "a😀b", 3, "a😀…"],
+  ])("%s", (_, text, maxLength, expected) => {
+    expect(truncate(text, maxLength)).toBe(expected);
   });
 });

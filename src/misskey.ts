@@ -41,9 +41,13 @@ export function isWebhookPayload(
 ): value is MisskeyWebhookPayload {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return (
-    typeof v.type === "string" && typeof v.body === "object" && v.body !== null
-  );
+  if (typeof v.type !== "string") return false;
+  if (typeof v.body !== "object" || v.body === null) return false;
+  // id のないノートは扱えない。例外で 500 になると、Misskey が再送し続ける
+  const note = (v.body as Record<string, unknown>).note;
+  if (note === undefined || note === null) return true;
+  const isObject = typeof note === "object";
+  return isObject && typeof (note as { id?: unknown }).id === "string";
 }
 
 export function noteUrl(
