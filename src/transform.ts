@@ -109,20 +109,27 @@ export function stripMfm(text: string): string {
  * URL の中の `@` や `:` を書き換えないよう、URL と重なるマッチを飛ばして置換する。
  * 区間に切り分けずに本文全体へかけるのは、前後の文字を見る先読み・後読みや
  * 行頭・行末の判定が、URL との境界でも正しく働くようにするため。
+ *
+ * markIndex を渡すと、マッチ全体ではなく、その位置の 1 文字が URL の中にあるかだけで判定する。
+ * メンションのマッチは記号の直前の文字も含むが、その文字が URL の末尾でも、
+ * URL の外にある記号は X がメンションとして扱うため。
  */
 function replaceOutsideUrls(
   text: string,
   pattern: RegExp,
   replacer: (match: string, groups: string[], offset: number) => string,
+  markIndex?: (groups: string[]) => number,
 ): string {
   const urls = findUrls(text);
   return text.replace(pattern, (match: string, ...rest: unknown[]) => {
     // 名前付きグループのない正規表現では、末尾の 2 つが offset と元の文字列
     const offset = rest[rest.length - 2] as number;
-    const end = offset + match.length;
-    const overlapsUrl = urls.some((u) => offset < u.end && end > u.start);
+    const groups = rest.slice(0, -2) as string[];
+    const start = markIndex ? offset + markIndex(groups) : offset;
+    const end = markIndex ? start + 1 : offset + match.length;
+    const overlapsUrl = urls.some((u) => start < u.end && end > u.start);
     if (overlapsUrl) return match;
-    return replacer(match, rest.slice(0, -2) as string[], offset);
+    return replacer(match, groups, offset);
   });
 }
 
@@ -181,11 +188,13 @@ export function defuseMentions(text: string): string {
     text,
     MENTION_PATTERN,
     (_, [prefix = "", mark = ""]) => `${prefix}${mark}​`,
+    ([prefix = ""]) => prefix.length,
   );
   return replaceOutsideUrls(
     defused,
     RT_MENTION_PATTERN,
     (_, [prefix = "", rt = "", mark = ""]) => `${prefix}${rt}${mark}​`,
+    ([prefix = "", rt = ""]) => prefix.length + rt.length,
   );
 }
 

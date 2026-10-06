@@ -9,7 +9,8 @@ const KV_TIMEOUT_MS = 1000;
 // 削除は応答の後に行うので長めに待つ。ただし返らないまま waitUntil の猶予を使い切ると、
 // 失敗のログも出ずに打ち切られるため、再試行を含めて猶予に収まる長さで打ち切る
 const DELETE_TIMEOUT_MS = 2000;
-// 打ち切った書き込みの完了を、削除の前に待つ上限
+// 打ち切った書き込みの完了を、削除の前に待つ上限。waitUntil の 30 秒の猶予の中で、
+// 削除と再試行を終えて失敗をログに残せるようにする
 const PENDING_WRITE_WAIT_MS = 5000;
 
 const sleep = (ms: number) =>
@@ -32,6 +33,24 @@ async function withKvTimeout<T>(
     return await Promise.race([promise, timeout]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * 削除の前に確かめた、記録の書き込みの結果。
+ * stored は保存できた、failed は例外で終わった、pending は待っても終わらなかった。
+ * failed でも、保存されたまま例外になっていることはある
+ */
+export type ClaimWrite = "stored" | "failed" | "pending";
+
+/** 記録を消せなかった。書き込みの結果を、ログで再送の結果を見分けるために運ぶ */
+export class ReleaseError extends Error {
+  constructor(
+    readonly claimWrite: ClaimWrite,
+    cause: unknown,
+  ) {
+    super(`failed to release claim: ${String(cause)}`, { cause });
+    this.name = "ReleaseError";
   }
 }
 
@@ -59,8 +78,11 @@ function parseClaimRecord(value: string): ClaimRecord {
 export class DeliveryLog {
   /** 同じキーへの書き込み制限に合わせるため、記録の書き込みが終わった（成否によらない）時刻 */
   private lastWriteAt: number | undefined;
-  /** 打ち切った後も続いている記録の書き込み。削除がこれに追い越されないよう、削除の前に待つ */
-  private pendingWrite: Promise<void> | undefined;
+  /**
+   * 直前の claim の書き込みと、その結果。打ち切った後も続いていることがあるため、
+   * 削除がこれに追い越されないよう削除の前に待ち、結果を ClaimWrite として返す
+   */
+  private pendingWrite: Promise<ClaimWrite> | undefined;
 
   constructor(private readonly kv: KVNamespace) {}
 
@@ -78,20 +100,26 @@ export class DeliveryLog {
   }
 
   async claim(noteId: string): Promise<void> {
-    // 値は調査用。重複の判定にはキーの有無だけを使う
-    const write = this.kv.put(
-      CLAIM_PREFIX + noteId,
-      JSON.stringify({
-        claimedAt: new Date().toISOString(),
-      } satisfies ClaimRecord),
-      { expirationTtl: CLAIM_TTL_SECONDS },
-    );
+    // 値は調査用。重複の判定にはキーの有無だけを使う。
+    // put が同期的に例外を投げても、書き込みの失敗として pendingWrite に残すため async で包む
+    const write = (async () =>
+      this.kv.put(
+        CLAIM_PREFIX + noteId,
+        JSON.stringify({
+          claimedAt: new Date().toISOString(),
+        } satisfies ClaimRecord),
+        { expirationTtl: CLAIM_TTL_SECONDS },
+      ))();
     // 書き込み制限の間隔は書き込みが終わってから数える。
     // 例外になっても保存されていることがあるため、成否によらず残す
-    const markWritten = () => {
+    const markWritten = (result: ClaimWrite) => () => {
       this.lastWriteAt = Date.now();
+      return result;
     };
-    this.pendingWrite = write.then(markWritten, markWritten);
+    this.pendingWrite = write.then(
+      markWritten("stored"),
+      markWritten("failed"),
+    );
     await withKvTimeout("put", write);
   }
 
@@ -99,16 +127,21 @@ export class DeliveryLog {
    * 記録を消す。直前の claim と同じキーへの書き込みになるため、
    * 書き込みが終わるのを待ってから間を空け、失敗したら間を空けて再試行する。
    * 応答の後に呼ぶ前提で、待っても応答は遅れない。
+   *
+   * claimWrite は、削除の前に確かめた記録の書き込みの結果。pending なら、
+   * 書き込みが削除の後に届いて記録が作り直され、再送がスキップされることがある。
+   * 削除がすべて失敗したときは、claimWrite を持つ ReleaseError を投げる。
    */
-  async release(noteId: string): Promise<void> {
-    // 打ち切った書き込みが削除の後に届くと、記録が作り直されて再送がスキップされる
-    if (this.pendingWrite) {
-      await withKvTimeout(
-        "put",
-        this.pendingWrite,
-        PENDING_WRITE_WAIT_MS,
-      ).catch(() => {});
-    }
+  async release(noteId: string): Promise<{ claimWrite: ClaimWrite }> {
+    // 打ち切った書き込みが削除の後に届くと、記録が作り直されて再送がスキップされる。
+    // claim の前に呼ばれることはないが、そのときは記録があるものとして扱う
+    const claimWrite: ClaimWrite = this.pendingWrite
+      ? await withKvTimeout(
+          "put",
+          this.pendingWrite,
+          PENDING_WRITE_WAIT_MS,
+        ).catch(() => "pending" as const)
+      : "stored";
     let lastError: unknown;
     for (let attempt = 0; attempt <= RELEASE_RETRIES; attempt++) {
       // 書き込みがまだ終わっていなければ、たった今書いたものとして間を空ける
@@ -124,11 +157,11 @@ export class DeliveryLog {
           this.kv.delete(CLAIM_PREFIX + noteId),
           DELETE_TIMEOUT_MS,
         );
-        return;
+        return { claimWrite };
       } catch (err) {
         lastError = err;
       }
     }
-    throw lastError;
+    throw new ReleaseError(claimWrite, lastError);
   }
 }

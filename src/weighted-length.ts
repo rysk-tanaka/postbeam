@@ -2,9 +2,19 @@
  * X の文字数カウント（twitter-text v3 の重み付けルールの簡易実装）。
  *
  * - 以下のコードポイント範囲は 1、それ以外（日本語など）は 2 として数える
- * - 絵文字は 1 書記素あたり 2
+ * - 絵文字を含む書記素は、標準の絵文字（RGI）の並びなら 2。それ以外（`❤︎` のような
+ *   テキスト表示の記号や、標準にない ZWJ・肌色の組み合わせ）は、文字ごとの重みの合計で
+ *   数え、最低 2 とする。`❤︎` や `🐱‍👤` のような単純な並びでは X と同じ値になる。
+ *   X は表にある部分列を 2 と数え、`©` を 1 と数えるので、こちらのほうが多くなることがある。
+ *   `🇯🇵` のような地域指示子の旗とキーキャップは文字ごとの合計で、X より多めになる
+ * - twitter-text の絵文字の表（twemoji-parser 11）より新しい並びは、twitter-text 3.1.0 では
+ *   文字ごとに数えられるが、ここでは RGI として 2 と数える。`🫃🏻` や `🐦‍🔥` がこれに当たる。
+ *   多めに数える方針の例外で、X が古い表を使っていれば少なく数えて上限を超えうる。
+ *   X のサーバーがどの表を使っているかは確かめられず、よく使う絵文字を一律に多めに数えると
+ *   切り詰めが早まりすぎるため、RGI の並びは一律 2 と数える
  * - URL は長さに関係なく 23。URL とみなす範囲は findUrls を参照。
- *   findUrls が拾わないプロトコル付きの文字列は、長さと 23 の大きいほう
+ *   findUrls が拾わないプロトコル付きの文字列は、中のドメインも 23 以上として数えた重みと
+ *   23 の大きいほう
  * - プロトコルなしのドメイン（`misskey.io`）は、長さと 23 の大きいほう。
  *   X が URL と判定するかは TLD の一覧などで決まるため、少なく数えて上限を
  *   超えないよう、多めに見積もる
@@ -88,7 +98,8 @@ const GENERIC_TLDS = [
   "nagoya",
 ];
 // X はラベルの先頭と末尾に - や _ を置いたホストを URL にしない
-const URL_HOST = String.raw`(?:(?![_-])[a-z0-9_-]+(?<![_-])\.)*(?!-)[a-z0-9-]+(?<!-)\.(?:[a-z]{2}|${GENERIC_TLDS.join("|")})(?![a-z0-9-])`;
+// TLD の直後が @ や + のときも、X は URL にしない
+const URL_HOST = String.raw`(?:(?![_-])[a-z0-9_-]+(?<![_-])\.)*(?!-)[a-z0-9-]+(?<!-)\.(?:[a-z]{2}|${GENERIC_TLDS.join("|")})(?![a-z0-9@+-])`;
 const URL_PATH_CHAR = String.raw`[A-Za-z0-9!?*';:=+,.$/%#\[\]()\-_~&|@]`;
 // この文字の直後にある https:// は、X が URL とみなさない
 const URL_BLOCKING_PREFIX = "A-Za-z0-9@＠$#＃";
@@ -101,10 +112,13 @@ const URL_BLOCKING_PREFIX_PATTERN = new RegExp(
   `^[${URL_BLOCKING_PREFIX}]$`,
   "u",
 );
-// X が URL の末尾に置ける文字。末尾にこれ以外の文字があれば URL に含めない
+// X が URL のパスの末尾に置ける文字。末尾にこれ以外の文字があれば URL に含めない。
+// クエリの末尾は URL_QUERY_ENDING_CHAR_PATTERN で判定し、? の直前と末尾の丸括弧の組の直前はこちらで判定する
 const URL_ENDING_CHAR_PATTERN = /^[A-Za-z0-9=_#/+\-)]$/u;
+// クエリ（? 以降）の末尾に置ける文字。パスと違って + と ) は置けず、末尾にあれば URL から外す。& は置ける
+const URL_QUERY_ENDING_CHAR_PATTERN = /^[A-Za-z0-9=_#/&-]$/u;
 // findUrls が拾わないプロトコル付きの文字列（国際化ドメイン、一覧にも英字 2 文字にも当てはまらない TLD など）。
-// X が URL とみなす場合に少なく数えないよう、長さと 23 の大きいほうで数える
+// X が URL とみなす場合に少なく数えないよう、中のドメインも 23 以上として数えた重みと 23 の大きいほうで数える
 // 日本語や全角の文字の手前で終える。続けて書いた本文まで 1 つのかたまりにすると、
 // 切り詰めでまるごと落ちてしまうため。国際化ドメインは https:// だけが 23 になり、
 // 残りは文字として数えるので、少なく数えることはない
@@ -114,6 +128,8 @@ const LOOSE_URL_PATTERN =
 const BARE_DOMAIN_PATTERN =
   /(?<![\w.@＠-])(?:[a-z0-9-]+\.)+[a-z]{2,}(?![\w-])/giu;
 const EMOJI_PATTERN = /\p{Extended_Pictographic}/u;
+// biome-ignore lint/complexity/useRegexLiterals: TS は target が ES2024 より前だと v フラグのリテラルをエラーにする
+const RGI_EMOJI_PATTERN = new RegExp("^\\p{RGI_Emoji}$", "v");
 
 const segmenter = new Intl.Segmenter("ja", { granularity: "grapheme" });
 
@@ -123,24 +139,58 @@ export interface UrlMatch {
 }
 
 /**
- * 対応する相手のない括弧があれば、その手前までの長さを返す。
- * X は対応の取れた括弧しか URL に含めない。
+ * 対応する相手のない丸括弧があれば、その手前までの長さを返す。
+ * X は対応の取れた丸括弧を入れ子 2 段まで URL に含める。ここでは段数を見ないので、
+ * 3 段以上では X より広い。角括弧は X が対応を見ずにふつうの文字として扱うので、ここでも数えない
  */
 function balancedLength(candidate: string): number {
-  const openers: { index: number; closer: string }[] = [];
+  const openers: number[] = [];
   for (let i = 0; i < candidate.length; i++) {
     const c = candidate[i];
-    if (c === "(" || c === "[") {
-      openers.push({ index: i, closer: c === "(" ? ")" : "]" });
-    } else if (c === ")" || c === "]") {
-      // 種類の違う括弧は対応とみなさない（`(` を `]` で閉じない）
-      const isMatched = openers.at(-1)?.closer === c;
-      if (!isMatched) return Math.min(i, openers[0]?.index ?? i);
+    if (c === "(") {
+      openers.push(i);
+    } else if (c === ")") {
+      // X は中身のない括弧も URL に含めないので、`()` も対応とみなさない
+      const opener = openers.at(-1);
+      const isMatched = opener !== undefined && opener < i - 1;
+      if (!isMatched) return Math.min(i, openers[0] ?? i);
       openers.pop();
     }
   }
   // 閉じられないまま残った開き括弧があれば、最初のものの手前までにする
-  return openers[0]?.index ?? candidate.length;
+  return openers[0] ?? candidate.length;
+}
+
+/**
+ * url の先頭から end 文字までを URL にしたとき、最後の文字が X の URL の末尾に置ける文字か。
+ * queryStart はクエリの先頭の ? の位置（なければ -1）。? 自体はパスの規則で判定する
+ */
+function isUrlEndingChar(
+  url: string,
+  end: number,
+  queryStart: number,
+): boolean {
+  const isInQuery = queryStart !== -1 && end - 1 > queryStart;
+  const pattern = isInQuery
+    ? URL_QUERY_ENDING_CHAR_PATTERN
+    : URL_ENDING_CHAR_PATTERN;
+  return pattern.test(url[end - 1] ?? "");
+}
+
+/** url の end の手前に続く、対応の取れた丸括弧の組を飛ばした位置を返す */
+function skipTrailingParens(url: string, end: number): number {
+  let start = end;
+  while (url[start - 1] === ")") {
+    let depth = 0;
+    let i = start - 1;
+    for (; i >= 0; i--) {
+      if (url[i] === ")") depth++;
+      else if (url[i] === "(" && --depth === 0) break;
+    }
+    if (i < 0) return start;
+    start = i;
+  }
+  return start;
 }
 
 /**
@@ -152,10 +202,39 @@ function trimUrlCandidate(candidate: string): string {
   // 末尾を外すと括弧の対応が崩れ、括弧で打ち切ると末尾が変わるので、変化がなくなるまで繰り返す
   let isChanged = true;
   while (isChanged) {
-    let end = balancedLength(url);
-    // 正規表現で末尾を外すと、句読点が長く続く入力でバックトラックが二乗になる
-    while (end > 0 && !URL_ENDING_CHAR_PATTERN.test(url[end - 1] ?? "")) {
-      end--;
+    const queryStart = url.indexOf("?");
+    // X はクエリでは括弧の対応を見ないので、パスの括弧だけを確かめる。
+    // クエリにも当てると、クエリの末尾から ) を外すたびに ( で打ち切ることになり、計算量が二乗になる。
+    // パスに ? は含まれないため、`/a(b?c)` の ( は閉じられていないものとして URL を `/a` までにする
+    const pathEnd = queryStart === -1 ? url.length : queryStart;
+    const balancedEnd = balancedLength(url.slice(0, pathEnd));
+    let end = balancedEnd < pathEnd ? balancedEnd : url.length;
+    // X はパスの末尾に置ける文字の直後の ? だけをクエリの始まりとみなす。
+    // `/a.?x=@user` では URL を `/a` までとし、`@user` はメンションになる。
+    // ? の直前が丸括弧の組なら、下のパスの末尾と同じく、その組の直前の文字で判定する
+    const hasQuery = queryStart !== -1 && queryStart < end;
+    if (hasQuery) {
+      const parensStart = skipTrailingParens(url, queryStart);
+      const isPathEndValid = URL_ENDING_CHAR_PATTERN.test(
+        url[parensStart - 1] ?? "",
+      );
+      if (!isPathEndValid) end = queryStart;
+    }
+    for (;;) {
+      // 正規表現で末尾を外すと、句読点が長く続く入力でバックトラックが二乗になる
+      while (end > 0 && !isUrlEndingChar(url, end, queryStart)) {
+        end--;
+      }
+      // X は末尾の対応の取れた丸括弧を、その直前がパスの末尾に置ける文字のときだけ URL に含める。
+      // `/a.(@user)` では URL を `/a` までとし、`@user` はメンションになる
+      const isInPath = queryStart === -1 || end <= queryStart;
+      if (!isInPath) break;
+      const parensStart = skipTrailingParens(url, end);
+      const isPathEndValid = URL_ENDING_CHAR_PATTERN.test(
+        url[parensStart - 1] ?? "",
+      );
+      if (isPathEndValid || parensStart === end) break;
+      end = parensStart;
     }
     isChanged = end !== url.length;
     url = url.slice(0, end);
@@ -168,7 +247,10 @@ export function continuesUrl(char: string): boolean {
   return URL_PATH_CHAR_PATTERN.test(char);
 }
 
-/** URL の末尾にあると、URL に含めない文字か */
+/**
+ * URL の末尾にあると、URL に含めない文字か。
+ * パスの末尾の規則だけで判定し、クエリの末尾で `+` と `)` を外し、`&` を含める規則は見ない
+ */
 export function isTrimmedFromUrlEnd(char: string): boolean {
   return !URL_ENDING_CHAR_PATTERN.test(char);
 }
@@ -200,16 +282,31 @@ function codePointWeight(cp: number): number {
 }
 
 function graphemeWeight(g: string): number {
-  if (EMOJI_PATTERN.test(g)) return 2;
   let w = 0;
   for (const ch of g) w += codePointWeight(ch.codePointAt(0) ?? 0);
-  return w;
+  // 旗（地域指示子）やキーキャップは絵文字の記号を含まないので、文字ごとの合計のまま多めに数える
+  if (!EMOJI_PATTERN.test(g)) return w;
+  if (RGI_EMOJI_PATTERN.test(g)) return 2;
+  // X は © などを 1 と数えるが、少なく数えないよう 2 と数える
+  return Math.max(w, 2);
 }
 
 function plainWeight(s: string): number {
   let w = 0;
   for (const { segment } of segmenter.segment(s)) w += graphemeWeight(segment);
   return w;
+}
+
+/** 中のプロトコルなしのドメインを、長さと 23 の大きいほうとして数える */
+function domainAwareWeight(s: string): number {
+  let w = 0;
+  let last = 0;
+  for (const m of s.matchAll(BARE_DOMAIN_PATTERN)) {
+    w += plainWeight(s.slice(last, m.index));
+    w += Math.max(m[0].length, URL_WEIGHT);
+    last = m.index + m[0].length;
+  }
+  return w + plainWeight(s.slice(last));
 }
 
 interface Token {
@@ -238,9 +335,12 @@ function tokenize(text: string): Token[] {
     let last = 0;
     for (const m of s.matchAll(LOOSE_URL_PATTERN)) {
       pushDomains(s.slice(last, m.index));
+      // X は、かたまりの中の後ろのドメイン（`https://example.com+misskey.io` の
+      // `misskey.io`）を URL として数えることがある。どれを数えるかは前後の文字で
+      // 変わるため、中のドメインをすべて 23 以上として多めに数える
       tokens.push({
         text: m[0],
-        weight: Math.max(plainWeight(m[0]), URL_WEIGHT),
+        weight: Math.max(domainAwareWeight(m[0]), URL_WEIGHT),
       });
       last = m.index + m[0].length;
     }
