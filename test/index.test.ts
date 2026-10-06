@@ -75,6 +75,33 @@ describe("handleRequest", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  test("secret と長さが同じでも中身が違えば 401 で、投稿しない", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetcher = mockFetch(200, bufferOk);
+    const res = await handleRequest(
+      request(makePayload(), "s3creT"),
+      bufferEnv,
+      ctx(),
+      fetcher,
+    );
+    expect(res.status).toBe(401);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test("secret が未登録なら、空のヘッダーでも 401 で、投稿しない", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetcher = mockFetch(200, bufferOk);
+    const { MISSKEY_HOOK_SECRET: _, ...envWithoutSecret } = bufferEnv;
+    const res = await handleRequest(
+      request(makePayload(), ""),
+      envWithoutSecret as Env,
+      ctx(),
+      fetcher,
+    );
+    expect(res.status).toBe(401);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   test("不正な JSON は 400", async () => {
     const req = new Request("https://postbeam.example/", {
       method: "POST",
@@ -195,6 +222,48 @@ describe("handleRequest", () => {
       channelId: "channel-1",
     });
   });
+
+  test.each([
+    [
+      "payload の server を MISSKEY_URL より優先する",
+      { server: "https://misskey.example/" },
+      { MISSKEY_URL: "https://mk.example" },
+      {},
+      "https://misskey.example/notes/a1b2c3",
+    ],
+    [
+      "server がなければ MISSKEY_URL を使う",
+      { server: undefined },
+      { MISSKEY_URL: "https://mk.example/" },
+      {},
+      "https://mk.example/notes/a1b2c3",
+    ],
+    [
+      "どちらもなければノートの url を使う",
+      { server: undefined },
+      {},
+      { url: "https://remote.example/notes/xyz" },
+      "https://remote.example/notes/xyz",
+    ],
+  ])(
+    "元ノートへのリンクは、%s",
+    async (_, payloadOverrides, envOverrides, noteOverrides, expected) => {
+      vi.spyOn(console, "info").mockImplementation(() => {});
+      const fetcher = mockFetch(200, bufferOk);
+      const env: Env = { ...bufferEnv, APPEND_LINK: "always", ...envOverrides };
+      const note = makeNote(noteOverrides);
+      await handleRequest(
+        request(makePayload(note, payloadOverrides)),
+        env,
+        ctx(),
+        fetcher,
+      );
+
+      const [, init] = fetcher.mock.calls[0] ?? [];
+      const sent = JSON.parse(String(init?.body));
+      expect(sent.variables.text).toBe(`こんにちは\n${expected}`);
+    },
+  );
 
   test("Buffer が投稿を拒否したら 422（Misskey は再送しない）", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -473,6 +542,10 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
     expect(deleteSpy).not.toHaveBeenCalled();
     await settle();
     expect(deleteSpy).toHaveBeenCalledTimes(1);
+    // 書き込みは終わっていたので、警告は出さない
+    expect(
+      loggedLines("warn", "released claim before the claim write finished"),
+    ).toEqual([]);
   });
 
   test("打ち切った書き込みが後から届いても、その後に削除して記録を残さない", async () => {
@@ -503,6 +576,43 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
     expect(deleteSpy).not.toHaveBeenCalled();
     await settle();
     expect(deleteSpy).toHaveBeenCalledTimes(1);
+    expect(memory.store.has(CLAIM_KEY)).toBe(false);
+    // 書き込みの完了を確かめてから消したので、警告は出さない
+    expect(
+      loggedLines("warn", "released claim before the claim write finished"),
+    ).toEqual([]);
+  });
+
+  test("打ち切った書き込みが 5 秒待っても終わらなければ、消してから警告を残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    vi.spyOn(memory.kv, "put").mockReturnValue(new Promise<never>(() => {}));
+    const deleteSpy = vi.spyOn(memory.kv, "delete");
+    const pending = send(mockFetch(503, { errors: [{ message: "busy" }] }));
+    // 投稿の前の記録の書き込みが、1 秒の上限まで待つ
+    await vi.advanceTimersByTimeAsync(1000);
+    expect((await pending).status).toBe(502);
+
+    // 書き込みを 5 秒待ってから、書き込み制限の 1.1 秒を空けて消す
+    await vi.advanceTimersByTimeAsync(5000 + 1099);
+    expect(deleteSpy).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    await settle();
+    expect(
+      loggedLines("warn", "released claim before the claim write finished"),
+    ).toEqual([
+      expect.objectContaining({
+        noteId: NOTE_ID,
+        dedupe: "claim-failed",
+        kind: "unavailable",
+        status: 503,
+      }),
+    ]);
+    // 再送で投稿し直されるかはわからないので、retries は付けない
+    expect(
+      loggedLines("warn", "released claim before the claim write finished")[0],
+    ).not.toHaveProperty("retries");
     expect(memory.store.has(CLAIM_KEY)).toBe(false);
   });
 
@@ -607,6 +717,66 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
       expect.objectContaining({
         dedupe: "claim-failed",
         retries: "may-repost",
+      }),
+    ]);
+  });
+
+  test("put が同期的に例外を投げ、削除も失敗したら、再送で投稿し直されることをログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    vi.spyOn(memory.kv, "put").mockImplementation(() => {
+      throw new Error("sync put failure");
+    });
+    memory.fail("delete");
+    const res = await send(mockFetch(503, { errors: [{ message: "busy" }] }));
+    expect(res.status).toBe(502);
+    await vi.runAllTimersAsync();
+    await settle();
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claim-failed",
+        retries: "may-repost",
+      }),
+    ]);
+  });
+
+  test("書き込みが終わらないまま削除も失敗したら、再送の結果はわからないとログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    vi.spyOn(memory.kv, "put").mockReturnValue(new Promise<never>(() => {}));
+    memory.fail("delete");
+    const pending = send(mockFetch(503, { errors: [{ message: "busy" }] }));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect((await pending).status).toBe(502);
+    await settle();
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claim-failed",
+        retries: "unknown",
+        error: `Error: kv delete failed: ${CLAIM_KEY}`,
+      }),
+    ]);
+  });
+
+  test("打ち切った書き込みが待っている間に保存されたら、削除の失敗は取りこぼしとしてログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const put = memory.kv.put.bind(memory.kv);
+    // 書き込みが 1 秒の上限を過ぎ、削除の前の待ちの間に保存されることにする
+    vi.spyOn(memory.kv, "put").mockImplementation(async (...args) => {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      return put(...args);
+    });
+    memory.fail("delete");
+    const pending = send(mockFetch(503, { errors: [{ message: "busy" }] }));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect((await pending).status).toBe(502);
+    await settle();
+    expect(memory.store.has(CLAIM_KEY)).toBe(true);
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claim-failed",
+        retries: "skipped",
       }),
     ]);
   });
@@ -853,7 +1023,7 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
     expect(memory.store.size).toBe(0);
   });
 
-  function loggedLines(method: "info" | "error", msg: string) {
+  function loggedLines(method: "info" | "warn" | "error", msg: string) {
     return vi
       .mocked(console[method])
       .mock.calls.map(([line]) => JSON.parse(String(line)))

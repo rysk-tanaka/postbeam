@@ -1,5 +1,5 @@
 import { ConfigError, type Env, loadConfig } from "./config";
-import { DeliveryLog } from "./dedupe";
+import { type ClaimWrite, DeliveryLog, ReleaseError } from "./dedupe";
 import { isWebhookPayload, noteUrl } from "./misskey";
 import {
   createPoster,
@@ -101,9 +101,16 @@ async function deliver(
   }
 }
 
+const RETRIES_BY_CLAIM_WRITE = {
+  stored: "skipped",
+  failed: "may-repost",
+  pending: "unknown",
+} as const satisfies Record<ClaimWrite, string>;
+
 /**
- * 記録を消す。応答を返した後も waitUntil で続けるため、失敗はログに残すだけにする。
- * 消せなかった記録が残ると、再送は重複としてスキップされる。
+ * 記録を消す。応答を返した後も waitUntil で続けるため、結果はログに残すだけにする。
+ * 消せなかったときの再送の結果は、削除の前に確かめた記録の書き込みの結果（ClaimWrite）で
+ * retries に出す。書き込みの完了を待ちきれずに消したときは、記録が作り直されうるので warn を出す。
  */
 async function releaseClaim(
   deliveries: DeliveryLog,
@@ -111,20 +118,35 @@ async function releaseClaim(
   claim: Extract<ClaimResult, "claimed" | "claim-failed">,
   postError: Pick<PosterError, "message" | "kind" | "status">,
 ): Promise<void> {
+  const logFields = {
+    noteId,
+    dedupe: claim,
+    postError: limitText(postError.message),
+    kind: postError.kind,
+    status: postError.status,
+  };
   try {
-    await deliveries.release(noteId);
+    const { claimWrite } = await deliveries.release(noteId);
+    if (claimWrite === "pending") {
+      // 書き込みが後で保存されれば再送はスキップされ、失敗すれば投稿し直される。
+      // どちらになるかはわからないため、retries は付けない
+      log("warn", "released claim before the claim write finished", logFields);
+    }
   } catch (err) {
     // この 1 行で取りこぼしかどうかと元の失敗がわかるようにする。
-    // 記録の書き込みに失敗していた（claim-failed）なら記録はおそらくなく、再送で投稿し直されうる。
-    // ただし保存されたまま例外になっていれば、再送はスキップされる
+    // 記録が保存されていれば、再送はスキップされる。claim-failed でも、打ち切った後に保存されていればこれに当たる。
+    // 書き込みが例外で終わっていれば記録はおそらくなく、再送で投稿し直されうる。
+    // ただし保存されたまま例外になっていれば、再送はスキップされる。
+    // 書き込みが終わらないままなら、後で保存されるかどうかで決まるため unknown にする。
+    // ReleaseError 以外の想定外の例外でも、書き込みの結果がわからないので unknown にする
+    const retries =
+      err instanceof ReleaseError
+        ? RETRIES_BY_CLAIM_WRITE[err.claimWrite]
+        : "unknown";
     log("error", "failed to release claim", {
-      noteId,
-      error: String(err),
-      dedupe: claim,
-      retries: claim === "claimed" ? "skipped" : "may-repost",
-      postError: limitText(postError.message),
-      kind: postError.kind,
-      status: postError.status,
+      ...logFields,
+      error: String(err instanceof ReleaseError ? err.cause : err),
+      retries,
     });
   }
 }

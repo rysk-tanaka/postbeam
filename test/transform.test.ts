@@ -218,6 +218,9 @@ describe("defuseMentions", () => {
     ["https://a.com/x×@alice", "x×@\u200Balice"],
     ["https://a.com/?q=é@alice", "é@\u200Balice"],
     ["https://a.com#@alice", "#@\u200Balice"],
+    ["https://ex.com/a.?x=@alice", "?x=@\u200Balice"],
+    ["https://ex.com/a&?x=@alice", "?x=@\u200Balice"],
+    ["https://ex.com/()@alice", "()@\u200Balice"],
   ])("%s の X で URL の外になる部分のメンションは無害化する", (input, tail) => {
     expect(defuseMentions(input).endsWith(tail)).toBe(true);
   });
@@ -238,15 +241,64 @@ describe("defuseMentions", () => {
     expect(defuseMentions(url)).toBe(url);
   });
 
+  test("クエリに空の角括弧がある URL の中の @ は変えない", () => {
+    const url = "https://example.com/?ids[]=1&x=@alice";
+    expect(defuseMentions(url)).toBe(url);
+  });
+
+  test("パスの括弧の中に ? がある URL では、括弧の後のメンションを無害化する", () => {
+    expect(defuseMentions("https://ex.com/x(a?b)@alice")).toBe(
+      "https://ex.com/x(a?b)@\u200Balice",
+    );
+  });
+
+  test("パスの末尾に置けない文字の後の括弧の中のメンションは無害化する", () => {
+    expect(defuseMentions("https://ex.com/a](@alice)")).toBe(
+      "https://ex.com/a](@\u200Balice)",
+    );
+  });
+
   test("括弧で囲んだ URL の直後のメンションは無害化する", () => {
     expect(defuseMentions("(https://example.com)@alice")).toBe(
       "(https://example.com)@\u200Balice",
     );
   });
+
+  // 全角の ＠ は URL に含まれないので、直前の文字が URL の末尾でも X はメンションとして扱う
+  test.each([
+    [
+      "見て https://example.com/＠alice",
+      "見て https://example.com/＠\u200Balice",
+    ],
+    ["https://misskey.io/＠alice", "https://misskey.io/＠\u200Balice"],
+    ["https://example.com/a-＠alice", "https://example.com/a-＠\u200Balice"],
+    ["https://example.com/RT＠alice", "https://example.com/RT＠\u200Balice"],
+  ])(
+    "%s の URL の直後の全角 ＠ のメンションは無害化する",
+    (input, expected) => {
+      expect(defuseMentions(input)).toBe(expected);
+    },
+  );
 });
 
 describe("buildPost", () => {
   const link = "https://misskey.io/notes/a1b2c3";
+
+  test("attachSensitive ならセンシティブ指定の画像も添付する", () => {
+    const files = [
+      {
+        id: "1",
+        type: "image/png",
+        url: "https://f/1.png",
+        isSensitive: true,
+      },
+    ];
+    const post = buildPost(
+      makeNote({ files }),
+      makeConfig({ attachSensitive: true }),
+    );
+    expect(post.imageUrls).toEqual(["https://f/1.png"]);
+  });
 
   test("本文を整形し、画像は 4 枚まででセンシティブを除く", () => {
     const files = [
