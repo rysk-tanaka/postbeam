@@ -63,8 +63,9 @@ Worker の `fetch` は、`handleRequest` の処理全体を `ctx.waitUntil` に�
 
 - `src/config.ts` — `Env`（シークレットと [vars]）の型と `loadConfig()`。不正な値は `ConfigError` を投げる
 - `src/misskey.ts` — Misskey の webhook payload とノートの型（必要な項目のみ）
-- `src/transform.ts` — 転送判定（`shouldForward`）と整形（`stripMfm` / `stripCustomEmoji` / `defuseMentions` / `buildPost`）。`stripCustomEmoji` と `defuseMentions` は URL の外側だけを置換する
+- `src/transform.ts` — 転送判定（`shouldForward`）と整形（`stripMfm` / `stripCustomEmoji` / `defuseMentions` / `buildPost`）。`stripCustomEmoji` と `defuseMentions` は URL の外側だけを置換する。`findUrls` が URL にしない国際化ドメインの URL なども X はリンクにするため、`stripCustomEmoji` はプロトコルで始まる走査のかたまりの中も書き換えない。リンク記法の前後と、詰めて取り除くカスタム絵文字の跡に空白を入れるかは、前後の本文とつなげたときに、`findUrls` と同じ走査で URL と認める範囲か消費する範囲が変わるかで決める（URL でなくなる場合と、`findUrls` が URL にしないリンク先を含む）。手前の `@` には後でゼロ幅スペースが入るので、入れた後の本文でも確かめる。まだ残っている目印は消える場合と空白になる場合の両方で確かめる。同じ語の中に並ぶ絵文字の跡も目印にして、同じように確かめる。リンクの直後の `#`・`＃`・`$` と、絵文字の跡の直後の `#`・`＃` は、詰めると X がハッシュタグやキャッシュタグとして読まなくなるので、確かめずに区切る。手前の語がハッシュタグやキャッシュタグで終わるときも、詰めるとタグが変わるか消えるので区切る。崩れた MFM で判定できずに残ったリンクの後ろの目印は、空白にする。つなげたときに後ろの結合文字が手前の文字と合成される（NFC の結果が変わる）ときも区切る。正規化で URL の直前の文字が変わると、X が URL とみなす範囲が変わるため、`buildPost` は X と同じく NFC に正規化してから整形と無害化をする。空白のない長い本文で時間がかからないよう、`.` を含まない語は走査せず、走査する文字数には `stripMfm` と `stripCustomEmoji` の呼び出しごとに上限を設け、超えたら確かめずに区切る。`defuseMentions` は、ゼロ幅スペースを入れると X が `@` の後ろのドメインから読み始めて URL の範囲が変わるため、変わらなくなるまで繰り返す。3 回で変わり続けるときは、URL の中かどうかにかかわらず残りを無害化する
 - `src/weighted-length.ts` — X の文字数カウント（twitter-text v3 の重み付けの簡易実装）と切り詰め、URL の検出（`findUrls`）
+- `src/tlds.ts` — twitter-text 3.1.0 の TLD の一覧（`validGTLD` と `validCCTLD`）
 - `src/dedupe.ts` — KV による転送の記録（`DeliveryLog`、キーは `claimed:<noteId>`）
 - `src/oauth1.ts` — OAuth 1.0a の署名（Web Crypto の HMAC-SHA1）
 - `src/posters/` — 投稿先。`buffer.ts`（GraphQL、`mode: shareNow`）と `x.ts`（X API v2、本文のみ）。失敗は `PosterError` の `kind`（`rejected` / `unavailable` / `unknown`）で、投稿されたかどうかを区別する
@@ -84,7 +85,7 @@ Worker の `fetch` は、`handleRequest` の処理全体を `ctx.waitUntil` に�
 - 投稿先との通信の上限は、記録の有無で変え、webhook の受信から数える（KV の操作が遅れたぶんも含める）。Misskey は 5 秒で切断して再送するが、処理は waitUntil で続く
   - 記録があるとき（`claimed`）は 20 秒（`CLAIMED_BUDGET_MS`）。再送は重複としてスキップされるので、遅れて届く 503 などの確定した応答を待つ。waitUntil の 30 秒の猶予の中で、記録の削除の時間を残す。期限を過ぎていても最低 1 秒は投稿を試みる。Misskey の再送が 60 秒以上あとに来ることが前提で、それより早い再送は、削除が間に合わず重複としてスキップされうる
   - 記録がないとき（KV なし、`unchecked`、`claim-failed`）は 4 秒（`UNCLAIMED_BUDGET_MS`）。再送を防げないため、5 秒の切断の前に打ち切って二重投稿を避ける。残りが 1 秒を切っていたら投稿せず、`unavailable`（502）にして再送に任せる
-- `findUrls` は X（twitter-text）が確実に URL とみなす範囲だけを返す。英数字の直後や一覧（`GENERIC_TLDS`）にも英字 2 文字にも当てはまらない TLD のホストは URL にせず、パスとクエリは ASCII だけにし、パスで対応の取れない丸括弧の手前で打ち切る。角括弧とクエリの括弧は、X と同じく対応を見ない。パスの末尾の丸括弧の組は、その直前がパスの末尾に置ける文字のときだけ含める。クエリの末尾の `)` と `+` は常に外し、`&` は含める。URL を広く取るとその中のメンションが無害化されずに別人へ通知が飛ぶため、ずれるなら狭い側に倒す。URL の外側だけを置換する処理と文字数のカウントの両方がこれに依存する。例外として、次の 2 つは X より広い。2 文字の TLD は実在するかを確認しない。丸括弧の入れ子の段数を見ないので、X が URL に含めない 3 段以上の入れ子も含める
+- `findUrls` は X（twitter-text 3.1.0）の `extractUrl` の正規表現をもとに、X と同じく直前の 1 文字を消費しながら本文を走査する。X が URL にしないかたまり（プロトコルのないドメインのクエリ、`$https://…`、BOM の直後など）も消費したまま次を探すので、その中の `https://…/@user` は URL とみなさない。ドメインは X の `validDomain` と同じく、TLD の一覧（`src/tlds.ts`）に当たる位置で終える。一覧の正規表現はコンパイルに数十 ms かかるため、正規表現にはせずに一覧を引く。TLD の大文字と小文字は、X の正規表現（u フラグのない `i`）と同じく 1 文字ずつ大文字にそろえて比べる。返すのはプロトコル付きの URL だけで、ホストが ASCII でラベルが 1〜63 文字のものに限る（X は国際化ドメインも URL にするが、変換後のラベルの長さを確かめないので URL にしない。`xn--` で始まるホストは英数字・`-`・`.` だけのものに限る。狭い側）。t.co の URL、URL の長さの上限（4096）も X に合わせる。URL を広く取るとその中のメンションが無害化されずに別人へ通知が飛ぶため、ずれるなら狭い側に倒す。URL の外側だけを置換する処理、リンク記法の区切り、文字数のカウントがこれに依存する
 - Buffer の GraphQL: `ChannelId` と `mode: shareNow` は実際の API で確認済み。画像は `assets: [{ image: { url } }]`（2026 年 5 月の仕様変更後の配列形式、型名は `AssetInput`）
 - Buffer は `assets: null` を受け付けず「Argument "input" has invalid value」を返す。画像がないときは `createPostMutation(false)` で assets を変数ごと含めない
 - Buffer API キーの権限は `posts:write` だけで足りる。API で取得するには `account:read` などの追加権限が要るため、チャンネル ID は Web 画面の URL から取得する
