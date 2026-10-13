@@ -297,13 +297,12 @@ describe("weightedLength", () => {
     expect(performance.now() - started).toBeLessThan(500);
   });
 
-  // twitter-text 3.1.0 では 43 と 40 で、後ろのドメインだけを URL として数える。
-  // ここでは中のドメインをすべて 23 以上として数えるので、それより少なくならない
+  // twitter-text 3.1.0 と同じく、後ろのドメインだけを URL として数える
   test.each([
     ["https://example.com+misskey.io", 43],
     ["https://x.jp@#:*~a.co", 40],
-  ])("findUrls が拾わない %s も、中のドメインを少なく数えない", (text, x) => {
-    expect(weightedLength(text)).toBeGreaterThanOrEqual(x);
+  ])("findUrls が拾わない %s は、X と同じく %i", (text, x) => {
+    expect(weightedLength(text)).toBe(x);
   });
 
   // twitter-text 3.1.0 の parseTweet の値
@@ -483,8 +482,8 @@ describe("weightedLength", () => {
   });
 
   test("パスを伸ばすドメインより前の絵文字は、文字ごとに数えない", () => {
-    // パスは文字として数える。X は `a.com/x` を 1 つの URL（23）とし、本文を 25 と数える
-    expect(weightedLength("👨‍👩‍👧a.com/x")).toBe(2 + 23 + 2);
+    // X は `a.com/x` を 1 つの URL（23）とし、本文を 25 と数える
+    expect(weightedLength("👨‍👩‍👧a.com/x")).toBe(2 + 23);
   });
 
   test("X が URL とみなす、ラベルに 。 を含むかたまりは、途中で切らずに落とす", () => {
@@ -538,10 +537,10 @@ describe("weightedLength", () => {
   });
 
   test("プロトコルのないドメインにパスが続くと、パスの途中で切らずに落とす", () => {
-    // X は 240 + 1 + 23 = 264 だが、パスを文字として数えて 284 とし、切り詰める。
+    // X は 260 + 1 + 23 = 284 で、上限を超える。
     // パスの途中で切ると、X は短いパスへのリンクにする
     const r = truncateWeighted(
-      `${"あ".repeat(120)} example.com/aaaa/bbbb/cccc/dddd`,
+      `${"あ".repeat(130)} example.com/aaaa/bbbb/cccc/dddd`,
     );
     expect(r.truncated).toBe(true);
     expect(r.text).not.toContain("example.com");
@@ -606,9 +605,96 @@ describe("weightedLength", () => {
     expect(truncateWeighted(text).truncated).toBe(true);
   });
 
-  test("プロトコルのないかたまりのパスの中のドメインは、文字として数える", () => {
-    // X は `a.jp/b.com` を 1 つの URL（23）とし、本文を 25 と数える。パスは文字として多めに数える
-    expect(weightedLength("例a.jp/b.com")).toBe(2 + 23 + 6);
+  test("プロトコルのないかたまりのパスの中のドメインは、URL に含めて数える", () => {
+    // X は `a.jp/b.com` を 1 つの URL（23）とし、本文を 25 と数える
+    expect(weightedLength("例a.jp/b.com")).toBe(2 + 23);
+  });
+
+  test("プロトコルのないドメインにパスが続くと、X と同じくパスまでを 23 と数える", () => {
+    expect(weightedLength("example.com/aaaa/bbbb/cccc/dddd")).toBe(23);
+    expect(weightedLength("見て example.com/aaaa/bbbb")).toBe(4 + 1 + 23);
+    expect(weightedLength("misskey.io:443/notes?x=1")).toBe(23);
+  });
+
+  test("プロトコルのないドメインにパスがなければ、ポートとクエリは文字として数える", () => {
+    expect(weightedLength("a.com:8080")).toBe(23 + 5);
+    expect(weightedLength("a.com?x=1")).toBe(23 + 4);
+  });
+
+  test("かたまりの中の手前のドメインは 23 とし、最後のドメインだけをパスまで伸ばす", () => {
+    expect(weightedLength("a.comあb.com/x")).toBe(23 + 2 + 23);
+  });
+
+  test("かたまりの中に同じドメインが続いても、前の URL の後ろから探す", () => {
+    expect(weightedLength("a.comとa.com/x")).toBe(23 + 2 + 23);
+    expect(weightedLength("a.comとa.com")).toBe(23 + 2 + 23);
+    const r = truncateWeighted(`a.comとa.com/x ${"い".repeat(20)}`, 40);
+    expect(r).toEqual({ text: "a.comと…", truncated: true });
+  });
+
+  test.each([
+    // X は URL の始まりを、手前に英数字を続けて現れる同じ文字列（`a.comx` の `a.com`）とし、
+    // そこから伸ばした URL の長さだけ読み飛ばす。残りの割れた文字は文字ごとに数える
+    ["a.comx👨‍👩‍👧a.com/y", 38],
+    ["a.comx𠀀a.com/y", 32],
+    ["b.jp1👨‍👩‍👧b.jp/1", 37],
+  ])("手前に同じ文字列があるドメインの %s は、X と同じく %i", (text, x) => {
+    expect(weightedLength(text)).toBe(x);
+  });
+
+  test("最後のドメインより後ろにドメインの部分が残れば、X と同じくその文字数だけ末尾を数える", () => {
+    // X は伸ばした URL の文字列（`a.com/x`）の長さだけ読み飛ばし、残りの `jp/x` を数える
+    expect(weightedLength("a.comあ.jp/x")).toBe(23 + 4);
+  });
+
+  test.each([
+    // X は直前が -・_・.・/ のプロトコルのないかたまりを URL にしない
+    ["/misskey.io", 11],
+    ["-example.com/x", 14],
+    ["見て_a.com/x", 4 + 8],
+    ["x..a.com/x", 10],
+    // ASCII のドメインを含まないかたまりは、パスがあっても URL にしない
+    ["あ 例え.jp/xxxx", 15],
+    // ラベルが 63 文字を超えるかたまりも URL にしない
+    [`x.${"a".repeat(64)}.com/x`, 72],
+    // 直前の文字に結合文字が続いても、直前の文字から数える
+    ["/\u0301a.com/x", 9],
+  ])(
+    "X が URL にしないプロトコルのないかたまり %s は、文字として数える",
+    (text, x) => {
+      expect(weightedLength(text)).toBe(x);
+    },
+  );
+
+  test("プロトコルのないかたまりの長さの上限は、https:// を付けた長さで確かめる", () => {
+    // X は https:// の長さとかたまりの長さの和が 4096 までなら URL にする
+    expect(weightedLength(`a.com/${"a".repeat(4082)}`)).toBe(23);
+    expect(weightedLength(`a.com/${"a".repeat(4083)}`)).toBe(4089);
+  });
+
+  test("長さの上限で URL にしないかたまりは、途中で切らずに落とす", () => {
+    // 途中で切ると、X は短いパスへのリンクにする
+    const r = truncateWeighted(`見て a.com/${"a".repeat(4083)}`);
+    expect(r).toEqual({ text: "見て…", truncated: true });
+  });
+
+  test("ラベルが長くて URL にしないかたまりも、ドメインより手前の日本語は残して切り詰める", () => {
+    // 日本語の直後のドメインでは、日本語もラベルになり、63 文字を超えて X は URL にしない
+    const text = `${"あ".repeat(100)}a.com/${"x".repeat(200)}`;
+    expect(weightedLength(text)).toBe(200 + 206);
+    const r = truncateWeighted(text);
+    expect(r).toEqual({ text: `${"あ".repeat(100)}…`, truncated: true });
+  });
+
+  test("直前の文字で URL にしないかたまりは、途中で切って残す", () => {
+    // X は 260 + 1 + 63 = 324 で、上限を超える。X は URL にしないので、途中で切ってもリンクにならない
+    const r = truncateWeighted(
+      `${"あ".repeat(130)} /example.com/${"a".repeat(50)}`,
+    );
+    expect(r).toEqual({
+      text: `${"あ".repeat(130)} /example.com/aaaa…`,
+      truncated: true,
+    });
   });
 
   test("findUrls が拾わない URL の直後の日本語は、URL と別に数えて切り詰める", () => {
@@ -632,11 +718,27 @@ describe("weightedLength", () => {
     expect(weightedLength("見て https://a.com.")).toBe(4 + 1 + 23 + 1);
   });
 
-  test("プロトコルなしのドメインは長さと 23 の大きいほう", () => {
+  test("プロトコルなしのドメインは長さに関係なく 23", () => {
+    expect(weightedLength("example.com")).toBe(23);
+    expect(weightedLength("見て example.com")).toBe(4 + 1 + 23);
+    expect(weightedLength("a-very-long-subdomain.example.com")).toBe(23);
+    expect(weightedLength("averyveryverylongdomainname.com")).toBe(23);
+  });
+
+  test("パスのないかたまりの「名前.国別の TLD」のドメインは、長さと 23 の大きいほう", () => {
+    // 古い twitter-text（JS 版 1.x）はこの形を URL にしないので、X が長さで数えても少なくならないようにする
+    const name = "averyveryverylongdomainname";
+    expect(weightedLength(`${name}.jp`)).toBe(30);
+    expect(weightedLength(`${name}.jp:80`)).toBe(30 + 3);
     expect(weightedLength("misskey.io")).toBe(23);
     expect(weightedLength("見て misskey.io")).toBe(4 + 1 + 23);
-    const longDomain = "a-very-long-subdomain.example.com";
-    expect(weightedLength(longDomain)).toBe(longDomain.length);
+    // かたまりにパスがあれば、どちらの規則でも、伸ばさない手前のドメインを含めて URL になる
+    expect(weightedLength(`${name}.jp/x`)).toBe(23);
+    expect(weightedLength(`${name}.jpとb.com/x`)).toBe(23 + 2 + 23);
+    // co と tv、サブドメインのあるドメインは、どちらの規則でも URL になる
+    expect(weightedLength(`${name}.co`)).toBe(23);
+    expect(weightedLength(`${name}.TV`)).toBe(23);
+    expect(weightedLength(`sub.${name}.jp`)).toBe(23);
   });
 
   test("数字だけの並びはドメインとみなさない", () => {
