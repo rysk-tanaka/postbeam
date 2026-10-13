@@ -350,16 +350,265 @@ describe("weightedLength", () => {
     ["/abcdefghijklmnopqrstu.みんな", 29],
     // URL の直前で TLD が終わるかは、URL の最初の文字まで見て決める
     ["え.jpmisskey.io.x.comindex.json.みんなhttps://a.co", 72],
+    // X はラベルにアクセント付きの文字を許す
+    ["café.com", 23],
+    ["é.コム", 23],
+    // X は国際化ドメインの URL を、走査で読んだかたまりの終わりまでとし、残りを文字として数える
+    ["https://café.com/a).", 25],
+    ["https://é.com_abc", 27],
+    ["https://é.com(@x)", 27],
+    ["https://é.co!!!", 26],
+    // X はプロトコルの後ろでドメインにならない部分を飛ばし、その先のドメインを URL として数える
+    ["https://(a.中国", 32],
+    ["x https://a.b/c,example.中国", 39],
+    ["http://localhost:8080/x&a.みんな", 47],
+    // X はアクセント付きの文字を URL の直前の文字として消費し、その後ろから URL を始める
+    ["ḁa.jp", 25],
+    ["$aéa.jp", 26],
+    ["@éa.jp", 25],
+    // X はクエリの終わりまでを消費し、その後ろのアクセント付きの文字を直前の文字として、
+    // その後ろから URL を始める
+    ["例え.jp?q=1caféa.jp", 38],
+    ["http://a.jp/éb.cx.comq=?u=coméexample.com", 47],
+    // X は伸ばした URL の文字列（`a.com/x`）の長さだけ読み飛ばし、割れた絵文字の並びを文字ごとに数える
+    ["a.com👨‍👩‍👧あ.jp/x", 36],
+    ["a.com👨‍👩‍👧あ.jp:80/x", 36],
+    ["a.com👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧あ.jp/x", 42],
+    // X は `❤️` の `❤` を URL の直前の文字として消費し、異体字セレクターからかたまりを読む。
+    // 結合文字は、1 つ目を直前の文字として消費する
+    ["❤️a.com", 25],
+    ["@❤️a.com", 26],
+    ["\u0301\u0301a.com", 24],
+    // X はスラッグが長すぎる t.co の URL を、URL にせず文字として数える
+    [`https://t.co/${"a".repeat(41)}`, 54],
+    [`https://t.co/${"a".repeat(41)}/x`, 56],
+    // X は t.co の URL をスラッグまでにし、残りを文字として数える。1 文字 2 の文字は 2
+    ["https://t.co/abc/xyz", 27],
+    [`https://t.co/abc/${"a".repeat(300)}`, 324],
+    ["https://t.co/abc/ếạ", 28],
+    // X は Punycode に変換したラベルが 63 文字を超える URL を、URL にせず文字として数える
+    [`https://${"日本語한국어".repeat(6)}.com/x`, 86],
+    [`https://${"a".repeat(13)}${"日本語한국어".repeat(3)}.com/x`, 63],
+    // 変換後のラベルの長さは、文字の並びで変わる（Punycode の bias の調整）
+    [
+      `https://ドメイン公式情報ゲーム大阪カタカナさくら会社ゲーム.jp/${"a".repeat(20)}`,
+      82,
+    ],
+    [
+      `https://ゲーム한국2024뉴스東京ニュースさくらカタカナ.jp/${"a".repeat(20)}`,
+      76,
+    ],
+    [
+      `https://륶ソユja룣ゼヰ갗갢쳑툐ィf쒶쉫xなょヰみメぐ.jp/${"a".repeat(20)}`,
+      74,
+    ],
+    [`https://${"a".repeat(37)}한국어東京.com/x`, 61],
+    [`https://aaaaaa${"日本語さくら".repeat(5)}.com/x`, 80],
+    // X は 。・｡ も . にして変換し、区切りを含めて 64 文字のラベルを URL にしない
+    [`https://x.${"a".repeat(31)}。${"b".repeat(32)}.com/x`, 81],
+    [`https://x.${"a".repeat(31)}｡${"b".repeat(32)}.com/x`, 81],
+    // X は xn-- で始まり、validAsciiDomain のドメインを含まないホストを URL にしない
+    [`https://xn--例.com/${"a".repeat(100)}`, 119],
+    // Prepend の文字（U+0600）は、直後のプロトコル付きの URL と別に数える
+    ["\u0600https://a.com", 24],
   ])("%s を X より少なく数えない", (text, x) => {
     expect(weightedLength(text)).toBeGreaterThanOrEqual(x);
   });
 
-  test("findUrls が拾わない URL も 23 より少なく数えない", () => {
-    // https:// を 23、残りを文字として数える
-    expect(weightedLength("https://例.jp")).toBe(23 + 2 + 3);
+  test("findUrls が拾わないプロトコル付きのかたまりは、X が URL とみなす場合と同じく 23", () => {
+    expect(weightedLength("https://例.jp")).toBe(23);
+    expect(weightedLength("https://café.com")).toBe(23);
     expect(weightedLength(`${"あ".repeat(130)} https://例.jp`)).toBe(
-      260 + 1 + 28,
+      260 + 1 + 23,
     );
+  });
+
+  test("アクセント付きの文字を含むドメインは、X と同じく 23 として切り詰める", () => {
+    // X は 23 + 1 + 257 = 281 で、上限を超える
+    const r = truncateWeighted(`café.com ${"x".repeat(257)}`);
+    expect(r.truncated).toBe(true);
+    expect(weightedLength(r.text)).toBeLessThanOrEqual(MAX_WEIGHTED_LENGTH);
+  });
+
+  test("findUrls が拾わない、日本語を含む長いかたまりも途中で切り詰める", () => {
+    // X は Punycode に変換したラベルが 63 文字を超えるかたまりを URL にせず、文字として数える（422）
+    const text = `https://example.com${"あ".repeat(200)}.jp`;
+    const r = truncateWeighted(text);
+    expect(r.truncated).toBe(true);
+    expect(r.text.startsWith("https://example.comあ")).toBe(true);
+    expect(weightedLength(r.text)).toBeLessThanOrEqual(MAX_WEIGHTED_LENGTH);
+  });
+
+  test.each([
+    // X は 。 も . として Punycode に変換し、変換後のラベルの長さで確かめる
+    [`https://x.${"a".repeat(58)}。b.com/notes/abc`],
+    // 変換後のラベルは、。を . にした 63 文字
+    [`https://x.${"a".repeat(31)}。${"b".repeat(31)}.com/x`],
+    [`https://x.${"a".repeat(31)}．${"b".repeat(31)}.com/x`],
+    [`https://x.${"a".repeat(31)}｡${"b".repeat(31)}.com/x`],
+    // 変換後のラベルは 63 文字。末尾に ム を足すと 64 文字で、X は URL にしない
+    [
+      `https://ドメイン公式情報ゲーム大阪カタカナさくら会社ゲー.jp/${"a".repeat(20)}`,
+    ],
+    // ASCII と日本語が混ざったラベルは、変換後に 62 文字
+    [`https://${"a".repeat(12)}${"日本語한국어".repeat(3)}.com/x`],
+    // 変換後のラベルは 63 文字。a を 1 つ足すと 64 文字で、X は URL にしない
+    [`https://${"a".repeat(36)}한국어東京.com/x`],
+    // 変換後のラベルは 60 文字。a を 1 つ足すと 64 文字に跳ぶ
+    [`https://aaaaa${"日本語さくら".repeat(5)}.com/x`],
+    // X はホストの日本語ごと 1 つの URL にする
+    ["https://example.comを見てください。詳細はmisskey.io"],
+  ])("X が URL とみなす国際化ドメインのかたまり %s は 23", (text) => {
+    expect(weightedLength(text)).toBe(23);
+  });
+
+  test("国際化ドメインの URL の長さの上限は、X と同じく変換前の長さで確かめる", () => {
+    // X はプロトコルの長さと URL の長さの和が 4096 までなら URL にする
+    expect(weightedLength(`https://例え.jp/${"a".repeat(4074)}`)).toBe(23);
+    expect(weightedLength(`https://例え.jp/${"a".repeat(4075)}`)).toBe(4091);
+  });
+
+  test("X が URL とみなす長い国際化ドメインの URL は、切り詰めない", () => {
+    // X は 256 + 1 + 23 = 280 で、上限に収まる
+    const text = `${"あ".repeat(128)} https://例え.jp/${"a".repeat(4070)}`;
+    expect(truncateWeighted(text)).toEqual({ text, truncated: false });
+  });
+
+  test("xn-- で始まるホストの URL も、X が URL とみなさない長さなら途中で切り詰める", () => {
+    // X は 4096 文字を超える URL をリンクにせず、文字として数える
+    const r = truncateWeighted(`https://xn--é.com/${"a".repeat(4100)}`);
+    expect(r.truncated).toBe(true);
+    expect(r.text.startsWith("https://xn--é.com/a")).toBe(true);
+    expect(weightedLength(r.text)).toBeLessThanOrEqual(MAX_WEIGHTED_LENGTH);
+  });
+
+  test("パスを伸ばすドメインより前の絵文字は、文字ごとに数えない", () => {
+    // パスは文字として数える。X は `a.com/x` を 1 つの URL（23）とし、本文を 25 と数える
+    expect(weightedLength("👨‍👩‍👧a.com/x")).toBe(2 + 23 + 2);
+  });
+
+  test("X が URL とみなす、ラベルに 。 を含むかたまりは、途中で切らずに落とす", () => {
+    const r = truncateWeighted(
+      // X は 260 + 1 + 23 = 284 で、上限を超える
+      `${"あ".repeat(130)} https://x.${"a".repeat(58)}。b.com/notes/abc`,
+    );
+    expect(r.truncated).toBe(true);
+    expect(r.text).not.toContain("https://");
+  });
+
+  test("スラッグが長すぎる t.co の URL は、文字として数えて切り詰める", () => {
+    // X は 240 + 1 + 73 = 314 で、上限を超える
+    const r = truncateWeighted(
+      `${"あ".repeat(120)} https://t.co/${"a".repeat(60)}`,
+    );
+    expect(r.truncated).toBe(true);
+    expect(weightedLength(r.text)).toBeLessThanOrEqual(MAX_WEIGHTED_LENGTH);
+  });
+
+  test("t.co の URL を縮めた残りも、文字として数えて切り詰める", () => {
+    // X は 240 + 1 + 23 + 61 = 325 で、上限を超える
+    const r = truncateWeighted(
+      `${"あ".repeat(120)} https://t.co/abc/${"a".repeat(60)}`,
+    );
+    expect(r.truncated).toBe(true);
+    expect(weightedLength(r.text)).toBeLessThanOrEqual(MAX_WEIGHTED_LENGTH);
+  });
+
+  test("パスの終わりで走査が書記素を割っても、書記素を割らずに切り詰める", () => {
+    // 走査は `#️⃣` の `#` でパスを終える。X は 254 + 1 + 23 + 4 = 282 で、上限を超える
+    const r = truncateWeighted(`${"x".repeat(254)} https://a.com/#️⃣`);
+    expect(r.truncated).toBe(true);
+    expect(r.text).not.toMatch(/#(?!\uFE0F\u20E3)/u);
+  });
+
+  test("走査が書記素の途中で区切っても、書記素を割らずに切り詰める", () => {
+    const r = truncateWeighted(`${"x".repeat(274)}#❤️a.com`);
+    expect(r.truncated).toBe(true);
+    // 異体字セレクターだけを落とすと、絵文字の表示が変わる
+    expect(r.text).not.toMatch(/❤(?!\uFE0F)/u);
+  });
+
+  test("X がリンクにしうる国際化ドメインの URL は、途中で切らずに落とす", () => {
+    const r = truncateWeighted(
+      // X は 260 + 1 + 23 = 284 で、上限を超える
+      `${"あ".repeat(130)} https://café.com/notes/abcdefghijklmnop`,
+    );
+    expect(r.truncated).toBe(true);
+    expect(r.text).not.toContain("https://");
+  });
+
+  test("プロトコルのないドメインにパスが続くと、パスの途中で切らずに落とす", () => {
+    // X は 240 + 1 + 23 = 264 だが、パスを文字として数えて 284 とし、切り詰める。
+    // パスの途中で切ると、X は短いパスへのリンクにする
+    const r = truncateWeighted(
+      `${"あ".repeat(120)} example.com/aaaa/bbbb/cccc/dddd`,
+    );
+    expect(r.truncated).toBe(true);
+    expect(r.text).not.toContain("example.com");
+  });
+
+  test("絵文字の直後のドメインも、絵文字を割らずに数えて切り詰める", () => {
+    // 走査は絵文字の上位サロゲートを直前の文字として消費し、下位サロゲートから読む
+    expect(weightedLength("🙂a.com")).toBe(25);
+    const r = truncateWeighted(`${"あ".repeat(137)} #🙂misskey.io`);
+    expect(r.truncated).toBe(true);
+    // u フラグでは、対になったサロゲートは 1 つのコードポイントになり、ここに当たらない
+    expect(r.text).not.toMatch(/[\uD800-\uDFFF]/u);
+  });
+
+  test("NFC に正規化してから数える", () => {
+    // `≠` は NFC で U+2260 になり、2 と数える。X は 25
+    expect(weightedLength("https://a.com/x=\u0338")).toBeGreaterThanOrEqual(25);
+    // X は 256 + 1 + 25 = 282 で、上限を超える
+    const r = truncateWeighted(`${"x".repeat(256)} https://a.com/x=\u0338`);
+    expect(r.truncated).toBe(true);
+  });
+
+  test("隣り合うかたまりで書記素の始まりまで戻しても、文字を重ねずに切り詰める", () => {
+    const text = `${"あ".repeat(120)}a.com/#️⃣b.com/#️⃣c.com${"い".repeat(20)}`;
+    const r = truncateWeighted(text);
+    expect(r.truncated).toBe(true);
+    expect(text.startsWith(r.text.slice(0, -1))).toBe(true);
+  });
+
+  test("濁点の結合文字を、手前のかなと分けずに切り詰める", () => {
+    const r = truncateWeighted(`${"x".repeat(274)} #あ\u3099a.com`);
+    expect(r.text).not.toMatch(/あ(?!\u3099)/u);
+  });
+
+  test("半角の濁点を、手前の半角のかなと分けずに切り詰める", () => {
+    const r = truncateWeighted(`${"x".repeat(274)} #ｶﾞa.com`);
+    expect(r.text).not.toMatch(/ｶ(?!ﾞ)/u);
+  });
+
+  test("Prepend の文字を、直後の文字と分けずに切り詰める", () => {
+    const r = truncateWeighted(`${"x".repeat(274)} #\u0600a.com`);
+    expect(r.text).not.toMatch(/\u0600(?!a)/u);
+  });
+
+  test.each([
+    // ラベルの途中から読み始めると、位置ごとに終わりまで読み直す
+    ["ドットのない長いラベル", `x.${"a".repeat(30000)}あ.com`],
+    // 変換後の長さを、文字の種類数と長さに比例する時間をかけて求めない
+    [
+      "文字の種類の多い長いホスト",
+      `https://${Array.from({ length: 30000 }, (_, i) => String.fromCodePoint(0x4e00 + (i % 20000))).join("")}.com`,
+    ],
+  ])("%s でも時間がかからない", (_, text) => {
+    const started = performance.now();
+    weightedLength(text);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  test("長い本文でも例外にならない", () => {
+    const text = "a".repeat(150000);
+    expect(weightedLength(text)).toBe(150000);
+    expect(truncateWeighted(text).truncated).toBe(true);
+  });
+
+  test("プロトコルのないかたまりのパスの中のドメインは、文字として数える", () => {
+    // X は `a.jp/b.com` を 1 つの URL（23）とし、本文を 25 と数える。パスは文字として多めに数える
+    expect(weightedLength("例a.jp/b.com")).toBe(2 + 23 + 6);
   });
 
   test("findUrls が拾わない URL の直後の日本語は、URL と別に数えて切り詰める", () => {
@@ -406,6 +655,17 @@ describe("truncateWeighted", () => {
       text: "短い文",
       truncated: false,
     });
+  });
+
+  test("指定した上限に収める", () => {
+    // リンクを付けるときは、URL の分を空けた上限で切り詰める
+    const r = truncateWeighted("あ".repeat(130), 256);
+    expect(r.truncated).toBe(true);
+    expect(weightedLength(r.text)).toBeLessThanOrEqual(256);
+    // 切った残りの photo.jp を数え直しても、指定した上限に収める
+    const text = `${"あ".repeat(122)}x photo.jpeg を添付${"い".repeat(200)}`;
+    const recounted = truncateWeighted(text, 256);
+    expect(weightedLength(recounted.text)).toBeLessThanOrEqual(256);
   });
 
   test("語の途中で切って残った部分を X が URL として数えても、上限を超えない", () => {
