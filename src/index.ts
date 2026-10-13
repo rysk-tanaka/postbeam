@@ -1,5 +1,5 @@
 import { ConfigError, type Env, loadConfig } from "./config";
-import { type ClaimWrite, DeliveryLog, ReleaseError } from "./dedupe";
+import { DeliveryLog, type ReleaseResult } from "./dedupe";
 import { isWebhookPayload, noteUrl } from "./misskey";
 import {
   createPoster,
@@ -101,16 +101,33 @@ async function deliver(
   }
 }
 
-const RETRIES_BY_CLAIM_WRITE = {
-  stored: "skipped",
-  failed: "may-repost",
-  pending: "unknown",
-} as const satisfies Record<ClaimWrite, string>;
+/**
+ * 記録を消せなかったときの、再送の結果。
+ * 記録が保存されていれば、再送はスキップされる（skipped）。claim-failed でも、打ち切った
+ * 書き込みが後で保存されていればこれに当たる。
+ * 書き込みが例外で終わっていれば記録はおそらくなく、再送で投稿し直されうる（may-repost）。
+ * ただし保存されたまま例外になっていれば、再送はスキップされる。
+ * 書き込みが終わっていなければ、後で保存されるかどうかで決まる（unknown）。
+ * 保存されていても、記録が消えているかもしれなければ（mayHaveDeleted）、unknown にする
+ */
+function retriesAfterFailedRelease(
+  result: Extract<ReleaseResult, { isReleased: false }>,
+): "skipped" | "may-repost" | "unknown" {
+  // ClaimWrite に値が増えたら、ここで扱わないと型エラーになるよう switch で分ける
+  switch (result.claimWrite) {
+    case "failed":
+      return "may-repost";
+    case "pending":
+      return "unknown";
+    case "stored":
+      return result.mayHaveDeleted ? "unknown" : "skipped";
+  }
+}
 
 /**
  * 記録を消す。応答を返した後も waitUntil で続けるため、結果はログに残すだけにする。
- * 消せなかったときの再送の結果は、削除の前に確かめた記録の書き込みの結果（ClaimWrite）で
- * retries に出す。書き込みの完了を待ちきれずに消したときは、記録が作り直されうるので warn を出す。
+ * 消せなかったときの再送の結果は、retries に出す。消せても、書き込みの完了を 2 回待っても
+ * 終わらなかったときは、記録が作り直されうるので warn を出す。
  */
 async function releaseClaim(
   deliveries: DeliveryLog,
@@ -125,30 +142,36 @@ async function releaseClaim(
     kind: postError.kind,
     status: postError.status,
   };
+  let result: ReleaseResult;
   try {
-    const { claimWrite } = await deliveries.release(noteId);
-    if (claimWrite === "pending") {
+    result = await deliveries.release(noteId);
+  } catch (err) {
+    // release は例外を投げないが、想定外の例外で waitUntil が黙って失敗しないよう残す。
+    // 記録が残っているかはわからない
+    log("error", "failed to release claim", {
+      ...logFields,
+      error: String(err),
+      retries: "unknown",
+      stack: stackOf(err),
+    });
+    return;
+  }
+  if (result.isReleased) {
+    if (result.claimWrite === "pending") {
       // 書き込みが後で保存されれば再送はスキップされ、失敗すれば投稿し直される。
       // どちらになるかはわからないため、retries は付けない
       log("warn", "released claim before the claim write finished", logFields);
     }
-  } catch (err) {
-    // この 1 行で取りこぼしかどうかと元の失敗がわかるようにする。
-    // 記録が保存されていれば、再送はスキップされる。claim-failed でも、打ち切った後に保存されていればこれに当たる。
-    // 書き込みが例外で終わっていれば記録はおそらくなく、再送で投稿し直されうる。
-    // ただし保存されたまま例外になっていれば、再送はスキップされる。
-    // 書き込みが終わらないままなら、後で保存されるかどうかで決まるため unknown にする。
-    // ReleaseError 以外の想定外の例外でも、書き込みの結果がわからないので unknown にする
-    const retries =
-      err instanceof ReleaseError
-        ? RETRIES_BY_CLAIM_WRITE[err.claimWrite]
-        : "unknown";
-    log("error", "failed to release claim", {
-      ...logFields,
-      error: String(err instanceof ReleaseError ? err.cause : err),
-      retries,
-    });
+    return;
   }
+  // この 1 行で取りこぼしかどうかと元の失敗がわかるようにする。retries が unknown の
+  // 理由（書き込みが終わっていないか、記録が消えているかもしれないか）を claimWrite で見分ける
+  log("error", "failed to release claim", {
+    ...logFields,
+    error: String(result.error),
+    claimWrite: result.claimWrite,
+    retries: retriesAfterFailedRelease(result),
+  });
 }
 
 const MAX_DETAIL_LENGTH = 1000;
