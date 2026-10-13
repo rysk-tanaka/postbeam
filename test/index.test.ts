@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { Env } from "../src/config";
+import { DeliveryLog } from "../src/dedupe";
 import worker, { handleRequest } from "../src/index";
 import { signOAuth1 } from "../src/oauth1";
 import { BUFFER_API_URL, BufferPoster } from "../src/posters/buffer";
@@ -421,6 +422,31 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
     });
   }
 
+  /** 記録の書き込みを 1 秒の上限を過ぎても終わらせず、後で保存するか失敗させる */
+  function deferClaimWrite(memory: MemoryKv) {
+    const put = memory.kv.put.bind(memory.kv);
+    const write = { store: () => {}, fail: () => {} };
+    vi.spyOn(memory.kv, "put").mockImplementation(
+      (...args) =>
+        new Promise<void>((resolve, reject) => {
+          write.store = () => {
+            void put(...args).then(resolve);
+          };
+          write.fail = () => reject(new Error("kv put failed"));
+        }),
+    );
+    return write;
+  }
+
+  /** 記録の書き込みを打ち切らせて、502 の応答まで進める */
+  async function sendWithTimedOutClaim(
+    send: (f: typeof fetch) => Promise<Response>,
+  ) {
+    const pending = send(mockFetch(503, { errors: [{ message: "busy" }] }));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect((await pending).status).toBe(502);
+  }
+
   beforeEach(() => {
     vi.spyOn(console, "info").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -598,7 +624,14 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
     expect(deleteSpy).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(deleteSpy).toHaveBeenCalledTimes(1);
+    // 消した後も書き込みの完了をもう 5 秒待ち、それまでは警告を出さない
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(
+      loggedLines("warn", "released claim before the claim write finished"),
+    ).toEqual([]);
     await settle();
+    // 書き込みが終わらないので、もう一度は消さない
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
     expect(
       loggedLines("warn", "released claim before the claim write finished"),
     ).toEqual([
@@ -616,6 +649,352 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
     expect(memory.store.has(CLAIM_KEY)).toBe(false);
   });
 
+  test("打ち切った書き込みが最初の削除の後に保存されたら、もう一度消して記録を残さない", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    const deleteSpy = vi.spyOn(memory.kv, "delete");
+    await sendWithTimedOutClaim(send);
+
+    // 書き込みを 5 秒待ちきれずに消す
+    await vi.advanceTimersByTimeAsync(5000 + 1100);
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    // 消した後に書き込みが届き、記録が作り直される
+    write.store();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(memory.store.has(CLAIM_KEY)).toBe(true);
+    // 書き込み制限に当たらないよう、届いた書き込みから間隔を空けて消し直す
+    await vi.advanceTimersByTimeAsync(1099);
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(deleteSpy).toHaveBeenCalledTimes(2);
+
+    await settle();
+    expect(deleteSpy).toHaveBeenCalledTimes(2);
+    expect(memory.store.has(CLAIM_KEY)).toBe(false);
+    // 書き込みの完了を確かめてから消し直したので、警告は出さない
+    expect(
+      loggedLines("warn", "released claim before the claim write finished"),
+    ).toEqual([]);
+    expect(loggedLines("error", "failed to release claim")).toEqual([]);
+  });
+
+  test("打ち切った書き込みが最初の削除の後に失敗しても、保存されていることがあるので消し直す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    const deleteSpy = vi.spyOn(memory.kv, "delete");
+    await sendWithTimedOutClaim(send);
+
+    await vi.advanceTimersByTimeAsync(5000 + 1100);
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    write.fail();
+    await settle();
+    expect(deleteSpy).toHaveBeenCalledTimes(2);
+    expect(loggedLines("error", "failed to release claim")).toEqual([]);
+  });
+
+  test("書き込みが終わった後に始めた削除で消せたら、消し直さない", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    const deleteSpy = vi.spyOn(memory.kv, "delete");
+    await sendWithTimedOutClaim(send);
+
+    // 5 秒の待ちが切れた後、最初の削除の前の間隔の間に書き込みが届く
+    await vi.advanceTimersByTimeAsync(5000 + 500);
+    write.store();
+    // 書き込み制限に当たらないよう、届いた書き込みから間隔を空け直す
+    await vi.advanceTimersByTimeAsync(1099);
+    expect(deleteSpy).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    await settle();
+    // 書き込みの後に消したので、作り直されることはない。消し直すと、書き込み制限に当たって
+    // 消せたのに失敗と報告しうる
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    expect(memory.store.has(CLAIM_KEY)).toBe(false);
+    expect(
+      loggedLines("warn", "released claim before the claim write finished"),
+    ).toEqual([]);
+    expect(loggedLines("error", "failed to release claim")).toEqual([]);
+  });
+
+  test("消せた削除の途中で書き込みが届いたら、書き込みの前の削除として消し直す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    const remove = memory.kv.delete.bind(memory.kv);
+    let resumeDelete = () => {};
+    // 最初の削除だけを途中で止める
+    const deleteSpy = vi.spyOn(memory.kv, "delete").mockImplementationOnce(
+      (key) =>
+        new Promise<void>((resolve) => {
+          resumeDelete = () => {
+            void remove(key).then(resolve);
+          };
+        }),
+    );
+    await sendWithTimedOutClaim(send);
+
+    await vi.advanceTimersByTimeAsync(5000 + 1100);
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    // 削除の途中で書き込みが届き、その後に削除が終わる
+    write.store();
+    await vi.advanceTimersByTimeAsync(0);
+    resumeDelete();
+    await settle();
+    // 書き込みと削除のどちらが先に KV に届いたかはわからないので、消し直す
+    expect(deleteSpy).toHaveBeenCalledTimes(2);
+    expect(memory.store.has(CLAIM_KEY)).toBe(false);
+    expect(
+      loggedLines("warn", "released claim before the claim write finished"),
+    ).toEqual([]);
+    expect(loggedLines("error", "failed to release claim")).toEqual([]);
+  });
+
+  test("書き込みの前の削除が失敗し、書き込みの後の再試行で消せたら、消し直さない", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    memory.fail("delete", { times: 1, isRateLimited: true });
+    const deleteSpy = vi.spyOn(memory.kv, "delete");
+    await sendWithTimedOutClaim(send);
+
+    // 書き込みを 5 秒待ちきれずに消し、最初の削除が拒まれた後で書き込みが届く
+    await vi.advanceTimersByTimeAsync(5000 + 1100);
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    write.store();
+    await settle();
+    // 再試行は書き込みの後に始めたので、記録が作り直されることはない
+    expect(deleteSpy).toHaveBeenCalledTimes(2);
+    expect(memory.store.has(CLAIM_KEY)).toBe(false);
+    expect(
+      loggedLines("warn", "released claim before the claim write finished"),
+    ).toEqual([]);
+    expect(loggedLines("error", "failed to release claim")).toEqual([]);
+  });
+
+  test("書き込みの前の削除が反映されたかもしれなくても、書き込みの後の再試行で消せたら、消し直さない", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    memory.fail("delete", { times: 1 });
+    const deleteSpy = vi.spyOn(memory.kv, "delete");
+    await sendWithTimedOutClaim(send);
+
+    await vi.advanceTimersByTimeAsync(5000 + 1100);
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    write.store();
+    await settle();
+    // 書き込みの後に消せたので、作り直された記録も消えている
+    expect(deleteSpy).toHaveBeenCalledTimes(2);
+    expect(memory.store.has(CLAIM_KEY)).toBe(false);
+    expect(loggedLines("error", "failed to release claim")).toEqual([]);
+  });
+
+  test("書き込みが終わった後に始めた削除がすべて失敗しても、消し直さずに取りこぼしとしてログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    memory.fail("delete", { isRateLimited: true });
+    const deleteSpy = vi.spyOn(memory.kv, "delete");
+    await sendWithTimedOutClaim(send);
+
+    // 5 秒の待ちが切れた後、最初の削除の前の間隔の間に書き込みが届く
+    await vi.advanceTimersByTimeAsync(5000 + 500);
+    write.store();
+    await settle();
+    // どの削除も書き込みの後なので、再試行の回数は記録できたときと同じ
+    expect(deleteSpy).toHaveBeenCalledTimes(3);
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claim-failed",
+        claimWrite: "stored",
+        retries: "skipped",
+      }),
+    ]);
+  });
+
+  test("書き込みの前の削除が拒まれ、書き込みの後の削除も失敗したら、消し直さずに取りこぼしとしてログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    // 書き込み制限で拒まれた削除は、反映されていない
+    memory.fail("delete", { isRateLimited: true });
+    const deleteSpy = vi.spyOn(memory.kv, "delete");
+    await sendWithTimedOutClaim(send);
+
+    // 書き込みを 5 秒待ちきれずに消し、最初の削除が失敗した後で書き込みが届く
+    await vi.advanceTimersByTimeAsync(5000 + 1100);
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    write.store();
+
+    await settle();
+    // 書き込みの前の削除は拒まれて記録を消しておらず、書き込みの後にも削除を試しているので、
+    // 消し直さない
+    expect(deleteSpy).toHaveBeenCalledTimes(3);
+    expect(memory.store.has(CLAIM_KEY)).toBe(true);
+    // 削除を始めた時点の pending ではなく、返す時点の書き込みの結果で決める
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claim-failed",
+        retries: "skipped",
+      }),
+    ]);
+  });
+
+  test("書き込みより前に消せた後で消し直しに失敗したら、再送の結果はわからないとログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    const deleteSpy = vi.spyOn(memory.kv, "delete");
+    await sendWithTimedOutClaim(send);
+
+    // 書き込みが終わる前に消せる
+    await vi.advanceTimersByTimeAsync(5000 + 1100);
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    // その後に書き込みが届き、消し直しは再試行も含めて書き込み制限で拒まれる
+    memory.fail("delete", { isRateLimited: true });
+    write.store();
+    await settle();
+    expect(deleteSpy).toHaveBeenCalledTimes(3);
+    // 書き込みが KV に届いたのが最初の削除より前なら、記録はもう消えている
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claim-failed",
+        retries: "unknown",
+      }),
+    ]);
+  });
+
+  test("先に打ち切った削除があり、消し直しに失敗したら、再送の結果はわからないとログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    const never = new Promise<never>(() => {});
+    const deleteSpy = vi
+      .spyOn(memory.kv, "delete")
+      .mockReturnValueOnce(never)
+      .mockReturnValueOnce(never)
+      .mockReturnValueOnce(never);
+    // 消し直しは書き込み制限で拒まれ、反映されていない
+    memory.fail("delete", { isRateLimited: true });
+    await sendWithTimedOutClaim(send);
+
+    await vi.advanceTimersByTimeAsync(5000 + 1100);
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    write.store();
+    await settle();
+    // 打ち切った 3 回と、書き込みが終わった後に消し直して失敗した 2 回
+    expect(deleteSpy).toHaveBeenCalledTimes(5);
+    // 打ち切った削除が、作り直された記録を後で消すことがある
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claim-failed",
+        retries: "unknown",
+      }),
+    ]);
+  });
+
+  test("書き込みが終わる前の削除がすべて拒まれたら、書き込みの完了を待ってから消し直す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    memory.fail("delete", { times: 3, isRateLimited: true });
+    const deleteSpy = vi.spyOn(memory.kv, "delete");
+    await sendWithTimedOutClaim(send);
+
+    // 書き込みが終わらないまま、3 回の削除がすべて拒まれる
+    await vi.advanceTimersByTimeAsync(5000 + 3 * 1100);
+    expect(deleteSpy).toHaveBeenCalledTimes(3);
+    // 2 回目の待ちの間に書き込みが届く。消し直さないと、記録が残って再送がスキップされる
+    await vi.advanceTimersByTimeAsync(1000);
+    write.store();
+    await settle();
+    expect(deleteSpy).toHaveBeenCalledTimes(4);
+    expect(memory.store.has(CLAIM_KEY)).toBe(false);
+    expect(
+      loggedLines("warn", "released claim before the claim write finished"),
+    ).toEqual([]);
+    expect(loggedLines("error", "failed to release claim")).toEqual([]);
+  });
+
+  test("消し直しも書き込み制限で拒まれたら、取りこぼしとしてログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    memory.fail("delete", { isRateLimited: true });
+    const deleteSpy = vi.spyOn(memory.kv, "delete");
+    await sendWithTimedOutClaim(send);
+
+    // 書き込みが終わる前の 3 回が拒まれた後、2 回目の待ちの間に書き込みが届く
+    await vi.advanceTimersByTimeAsync(5000 + 3 * 1100 + 1000);
+    expect(deleteSpy).toHaveBeenCalledTimes(3);
+    write.store();
+    await settle();
+    // 拒まれた 3 回と、消し直しの 2 回。どれも記録を消していないので、記録は残っている
+    expect(deleteSpy).toHaveBeenCalledTimes(5);
+    expect(memory.store.has(CLAIM_KEY)).toBe(true);
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claim-failed",
+        claimWrite: "stored",
+        error: "Error: KV DELETE failed: 429 Too Many Requests",
+        retries: "skipped",
+      }),
+    ]);
+  });
+
+  test("消し直しだけが打ち切られても、再送の結果はわからないとログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    const write = deferClaimWrite(memory);
+    const remove = memory.kv.delete.bind(memory.kv);
+    // 書き込みが終わる前の削除 3 回は書き込み制限で拒まれ、消し直しは返らない
+    memory.fail("delete", { times: 3, isRateLimited: true });
+    const deleteSpy = vi
+      .spyOn(memory.kv, "delete")
+      .mockImplementation((key) =>
+        deleteSpy.mock.calls.length <= 3
+          ? remove(key)
+          : new Promise<never>(() => {}),
+      );
+    await sendWithTimedOutClaim(send);
+
+    await vi.advanceTimersByTimeAsync(5000 + 3 * 1100);
+    write.store();
+    await settle();
+    // 拒まれた 3 回と、消し直しの 2 回
+    expect(deleteSpy).toHaveBeenCalledTimes(5);
+    // 打ち切った消し直しが、後で記録を消すことがある
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claim-failed",
+        claimWrite: "stored",
+        retries: "unknown",
+      }),
+    ]);
+  });
+
+  test("最も時間のかかる流れでも、応答から 30 秒以内に削除の失敗をログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send } = setup();
+    const write = deferClaimWrite(memory);
+    vi.spyOn(memory.kv, "delete").mockReturnValue(new Promise<never>(() => {}));
+    await sendWithTimedOutClaim(send);
+
+    // 待ち 5 秒、打ち切られる削除 3 回（間隔 1.1 秒と打ち切り 2 秒）の後、
+    // 2 回目の待ちが切れる直前に書き込みが届き、消し直しの 2 回も打ち切られる
+    await vi.advanceTimersByTimeAsync(5000 + 3 * (1100 + 2000) + 4999);
+    write.store();
+    // waitUntil は応答から 30 秒で打ち切られる
+    await vi.advanceTimersByTimeAsync(30_000 - (5000 + 3 * 3100 + 4999) - 1);
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({ dedupe: "claim-failed", retries: "unknown" }),
+    ]);
+  });
+
   test("削除が返らなければ打ち切って再試行し、使い切ったらログに残す", async () => {
     vi.useFakeTimers();
     const { memory, send, settle } = setup();
@@ -623,9 +1002,49 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
     await send(mockFetch(503, { errors: [{ message: "busy" }] }));
     await settle();
     expect(memory.kv.delete).toHaveBeenCalledTimes(3);
+    // 記録は保存されているが、打ち切った削除が後で届けば消えるので、再送の結果はわからない
     expect(loggedLines("error", "failed to release claim")).toEqual([
       expect.objectContaining({
+        dedupe: "claimed",
         error: expect.stringContaining("kv delete timed out after 2000ms"),
+        retries: "unknown",
+      }),
+    ]);
+  });
+
+  test("打ち切った削除と書き込み制限で拒まれた削除が混ざっても、再送の結果はわからないとログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    vi.spyOn(memory.kv, "delete").mockReturnValueOnce(
+      new Promise<never>(() => {}),
+    );
+    memory.fail("delete", { isRateLimited: true });
+    await send(mockFetch(503, { errors: [{ message: "busy" }] }));
+    await settle();
+    expect(memory.kv.delete).toHaveBeenCalledTimes(3);
+    // 最後の失敗が打ち切りでなくても、最初に打ち切った削除が後で届くことがある
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claimed",
+        error: "Error: KV DELETE failed: 429 Too Many Requests",
+        claimWrite: "stored",
+        retries: "unknown",
+      }),
+    ]);
+  });
+
+  test("例外で終わった削除は反映されていることがあるので、再送の結果はわからないとログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    memory.fail("delete");
+    await send(mockFetch(503, { errors: [{ message: "busy" }] }));
+    await settle();
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claimed",
+        error: `Error: kv delete failed: ${CLAIM_KEY}`,
+        claimWrite: "stored",
+        retries: "unknown",
       }),
     ]);
   });
@@ -682,10 +1101,10 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
     expect(memory.store.has(CLAIM_KEY)).toBe(false);
   });
 
-  test("記録の削除がすべて失敗しても 502 のままで、ログに残す", async () => {
+  test("記録の削除がすべて書き込み制限で拒まれても 502 のままで、取りこぼしとしてログに残す", async () => {
     vi.useFakeTimers();
     const { memory, send, settle } = setup();
-    memory.fail("delete");
+    memory.fail("delete", { isRateLimited: true });
     const res = await send(mockFetch(503, { errors: [{ message: "busy" }] }));
     expect(res.status).toBe(502);
     await vi.runAllTimersAsync();
@@ -694,12 +1113,49 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
     expect(loggedLines("error", "failed to release claim")).toEqual([
       expect.objectContaining({
         noteId: NOTE_ID,
-        error: expect.stringContaining("kv delete failed"),
+        error: "Error: KV DELETE failed: 429 Too Many Requests",
         dedupe: "claimed",
+        claimWrite: "stored",
         retries: "skipped",
         postError: "Buffer API error (503): busy",
         kind: "unavailable",
         status: 503,
+      }),
+    ]);
+  });
+
+  test("KV の失敗の形でない 429 は、拒まれたとみなさない", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    // 別の文字列に紛れた 429 は、書き込み制限による拒否とは限らない
+    vi.spyOn(memory.kv, "delete").mockRejectedValue(
+      new Error("network connection lost (request 429)"),
+    );
+    await send(mockFetch(503, { errors: [{ message: "busy" }] }));
+    await settle();
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claimed",
+        claimWrite: "stored",
+        retries: "unknown",
+      }),
+    ]);
+  });
+
+  test("記録の削除が 1 日の上限で拒まれたら、取りこぼしとしてログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    // 無料プランの上限を超えたときの KV のメッセージ
+    vi.spyOn(memory.kv, "delete").mockRejectedValue(
+      new Error("KV delete() limit exceeded for the day."),
+    );
+    await send(mockFetch(503, { errors: [{ message: "busy" }] }));
+    await settle();
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claimed",
+        claimWrite: "stored",
+        retries: "skipped",
       }),
     ]);
   });
@@ -717,6 +1173,42 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
       expect.objectContaining({
         dedupe: "claim-failed",
         retries: "may-repost",
+      }),
+    ]);
+  });
+
+  test("記録の書き込みが失敗していれば、削除が打ち切られても再送で投稿し直されることをログに残す", async () => {
+    vi.useFakeTimers();
+    const { memory, send, settle } = setup();
+    memory.fail("put", { keyPrefix: "claimed:" });
+    vi.spyOn(memory.kv, "delete").mockReturnValue(new Promise<never>(() => {}));
+    await send(mockFetch(503, { errors: [{ message: "busy" }] }));
+    await settle();
+    // 記録はおそらくなく、打ち切った削除はそれを消すだけなので、再送で投稿し直される
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        dedupe: "claim-failed",
+        claimWrite: "failed",
+        retries: "may-repost",
+      }),
+    ]);
+  });
+
+  test("記録の削除で想定外の例外が出ても、waitUntil で黙って失敗せずにログに残す", async () => {
+    vi.useFakeTimers();
+    const { send, settle } = setup();
+    vi.spyOn(DeliveryLog.prototype, "release").mockRejectedValue(
+      new Error("boom"),
+    );
+    const res = await send(mockFetch(503, { errors: [{ message: "busy" }] }));
+    expect(res.status).toBe(502);
+    await settle();
+    expect(loggedLines("error", "failed to release claim")).toEqual([
+      expect.objectContaining({
+        noteId: NOTE_ID,
+        error: "Error: boom",
+        retries: "unknown",
+        stack: expect.stringContaining("boom"),
       }),
     ]);
   });
@@ -745,13 +1237,18 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
     const { memory, send, settle } = setup();
     vi.spyOn(memory.kv, "put").mockReturnValue(new Promise<never>(() => {}));
     memory.fail("delete");
+    const deleteSpy = vi.spyOn(memory.kv, "delete");
     const pending = send(mockFetch(503, { errors: [{ message: "busy" }] }));
     await vi.advanceTimersByTimeAsync(1000);
     expect((await pending).status).toBe(502);
     await settle();
+    // 2 回目の待ちでも書き込みが終わらないので、消し直さない
+    expect(deleteSpy).toHaveBeenCalledTimes(3);
+    // retries が unknown なのは、書き込みが終わっていないため
     expect(loggedLines("error", "failed to release claim")).toEqual([
       expect.objectContaining({
         dedupe: "claim-failed",
+        claimWrite: "pending",
         retries: "unknown",
         error: `Error: kv delete failed: ${CLAIM_KEY}`,
       }),
@@ -767,7 +1264,7 @@ describe("handleRequest（KV による重複投稿の防止）", () => {
       await new Promise((resolve) => setTimeout(resolve, 3000));
       return put(...args);
     });
-    memory.fail("delete");
+    memory.fail("delete", { isRateLimited: true });
     const pending = send(mockFetch(503, { errors: [{ message: "busy" }] }));
     await vi.advanceTimersByTimeAsync(1000);
     expect((await pending).status).toBe(502);

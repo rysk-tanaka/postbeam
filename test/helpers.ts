@@ -43,16 +43,20 @@ interface KvFailure {
   method: KvMethod;
   keyPrefix: string;
   remaining: number;
+  isRateLimited: boolean;
 }
 
 export interface MemoryKv {
   kv: KVNamespace;
   store: Map<string, string>;
   ttls: Map<string, number | undefined>;
-  /** KV の障害や書き込み制限を模擬するため、条件に合う呼び出しを times 回だけ失敗させる */
+  /**
+   * KV の障害や書き込み制限を模擬するため、条件に合う呼び出しを times 回だけ失敗させる。
+   * isRateLimited なら、同じキーへの書き込み制限（429）で拒まれた失敗にする
+   */
   fail(
     method: KvMethod,
-    options?: { keyPrefix?: string; times?: number },
+    options?: { keyPrefix?: string; times?: number; isRateLimited?: boolean },
   ): void;
 }
 
@@ -71,6 +75,12 @@ export function createMemoryKv(initial: Record<string, string> = {}): MemoryKv {
     });
     if (!failure) return;
     failure.remaining--;
+    // 書き込み制限は、workerd の KV が投げるメッセージの形にする
+    if (failure.isRateLimited) {
+      throw new Error(
+        `KV ${method.toUpperCase()} failed: 429 Too Many Requests`,
+      );
+    }
     throw new Error(`kv ${method} failed: ${key}`);
   };
 
@@ -100,8 +110,15 @@ export function createMemoryKv(initial: Record<string, string> = {}): MemoryKv {
     kv: kv as unknown as KVNamespace,
     store,
     ttls,
-    fail(method, { keyPrefix = "", times = Number.POSITIVE_INFINITY } = {}) {
-      failures.push({ method, keyPrefix, remaining: times });
+    fail(
+      method,
+      {
+        keyPrefix = "",
+        times = Number.POSITIVE_INFINITY,
+        isRateLimited = false,
+      } = {},
+    ) {
+      failures.push({ method, keyPrefix, remaining: times, isRateLimited });
     },
   };
 }
