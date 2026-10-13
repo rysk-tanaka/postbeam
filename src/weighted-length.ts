@@ -21,10 +21,14 @@
  *   文字として数える。findUrls が URL にしないプロトコル付きのかたまり（国際化ドメインなど）も、
  *   X が URL とみなせば 23、みなさなければ文字ごとの重みで数える。`xn--` で始まり英数字・`-`・`.`
  *   以外を含むホストは、X が URL とみなすかを確かめないので、その大きいほう
- * - プロトコルのないかたまりの、ドメインの部分の中のドメイン（`misskey.io`）は、長さと 23 の
- *   大きいほう。直前の文字は走査で確かめるが、`-`・`_`・`.`・`/` の直後の URL を
- *   X が捨てる規則までは確かめないので、URL とみなす場合の 23 と、みなさない場合の長さの
- *   大きいほうで多めに見積もる
+ * - プロトコルのないかたまりの、ドメインの部分の中のドメイン（`example.com`）は 23。
+ *   パスが続けば、X と同じく最後のドメインをかたまりの終わりまで伸ばして 23 と数える。
+ *   最後のドメインより後ろにドメインの部分が残れば（`a.comあ.jp/x` の `あ.jp`）、その文字数だけ
+ *   かたまりの末尾を足す（pushDomainTokens を参照）。
+ *   直前の文字が `-`・`_`・`.`・`/` のかたまりと、ラベルや長さが X の上限を超えるかたまりは、
+ *   X と同じく URL にせず、文字として数える。
+ *   例外として、パスのないかたまりの `名前.国別の TLD` のドメイン（`misskey.io`）は、長さと 23 の
+ *   大きいほう（bareDomainToken を参照）
  */
 import { COUNTRY_TLDS, GENERIC_TLDS } from "./tlds";
 
@@ -76,6 +80,10 @@ const URL_REST_PATTERN = new RegExp(
   "iy",
 );
 const PROTOCOL_AT_PATTERN = /https?:\/\//iy;
+// X はプロトコルのないかたまりを、このプロトコルを付けた長さで確かめる
+const DEFAULT_PROTOCOL = "https://";
+// この文字の直後にあるプロトコルのないかたまりは、X が URL にしない
+const INVALID_BARE_URL_PRECEDING_CHAR_PATTERN = /^[-_./]$/;
 const URL_BLOCKING_PREFIX_PATTERN = new RegExp(`^[${URL_BLOCKING_PREFIX}]$`);
 // X は TLD の一覧を順に試し、直後が英数字・@・+・- でない最初のものを TLD とする。一覧から
 // 正規表現を作るとコンパイルに数十 ms かかるので、一覧を引いて確かめる。英数字の TLD は
@@ -84,6 +92,9 @@ const URL_BLOCKING_PREFIX_PATTERN = new RegExp(`^[${URL_BLOCKING_PREFIX}]$`);
 // 大文字と小文字は、X の正規表現（u フラグのない i）と同じく canonicalize でそろえて比べる
 const TLDS = [...GENERIC_TLDS, ...COUNTRY_TLDS];
 const ASCII_TLDS = new Set(TLDS.filter((tld) => /^[a-z0-9-]+$/.test(tld)));
+const COUNTRY_TLD_SET = new Set(COUNTRY_TLDS.map(canonicalize));
+// 古い twitter-text（JS 版 1.x の validSpecialShortDomain）が、パスがなくても URL にする国別の TLD
+const SPECIAL_SHORT_DOMAIN_TLDS = new Set(["CO", "TV"]);
 const OTHER_TLDS_BY_FIRST_CHAR = new Map<string, string[]>();
 for (const tld of TLDS.filter((tld) => !ASCII_TLDS.has(tld))) {
   const canonical = canonicalize(tld);
@@ -163,13 +174,23 @@ function xUrlLength(
   protocol: string,
   host: string,
 ): number | undefined {
-  if (!hasValidIdnaLabels(host)) return undefined;
   // X は長さの上限を、t.co の URL を縮める前に確かめる
-  if (protocol.length + match.length > MAX_URL_LENGTH) return undefined;
+  if (!isWithinXUrlLimits(protocol.length + match.length, host)) {
+    return undefined;
+  }
   const tco = TCO_URL_PATTERN.exec(match);
   if (!tco) return match.length;
   const slug = tco[1] ?? "";
   return slug.length > MAX_TCO_SLUG_LENGTH ? undefined : tco[0].length;
+}
+
+/**
+ * X（twitter-text の extractUrlsWithIndices の中の isValidUrl）が URL と認める長さとラベルか。
+ * length はプロトコルの長さと URL の長さ（プロトコルを含む）の和で、プロトコルのないかたまりでは
+ * https:// を付けた長さ。host はそのドメインの部分
+ */
+function isWithinXUrlLimits(length: number, host: string): boolean {
+  return length <= MAX_URL_LENGTH && hasValidIdnaLabels(host);
 }
 
 /**
@@ -460,7 +481,8 @@ function matchUrlAt(
   URL_REST_PATTERN.lastIndex = hostEnd;
   const hasPath = URL_REST_PATTERN.exec(text)?.[1] !== undefined;
   const consumedEnd = URL_REST_PATTERN.lastIndex;
-  // プロトコルのないドメインは URL として返さず、文字数の側で多めに数える
+  // プロトコルのないドメインは URL として返さない。X が URL にするかは、文字数の側
+  // （tokenize と pushDomainTokens）で決める
   if (!protocol) return { start, hostStart, hostEnd, consumedEnd, hasPath };
   const match = text.slice(start, consumedEnd);
   const host = text.slice(hostStart, hostEnd);
@@ -705,6 +727,47 @@ function bareDomainEnd(
   return undefined;
 }
 
+/**
+ * プロトコルのないかたまりの直前の文字が、X（twitter-text の extractUrlsWithIndices）が
+ * かたまりの中のドメインを 1 つも URL にしない文字（`-`・`_`・`.`・`/`）か
+ */
+function hasBlockingPrecedingChar(text: string, scan: ScanMatch): boolean {
+  // 走査は本文の先頭で直前の文字なしでも試すので、start が 0 なら直前の文字はない
+  const before = text[scan.start - 1] ?? "";
+  return INVALID_BARE_URL_PRECEDING_CHAR_PATTERN.test(before);
+}
+
+/**
+ * プロトコルのないかたまりが、X（extractUrlsWithIndices の中の isValidUrl）に当たるか。
+ * 当たらない（ドメインの部分のラベルが Punycode で 1〜63 文字にならないか、https:// を付けた
+ * 長さが上限を超える）と、X はかたまりの中のドメインを 1 つも URL にしない。
+ * xn-- で始まるドメインの部分を validAsciiDomain のドメインを含むかで捨てる規則は、
+ * bareDomains がドメインを見つければ必ず通るので確かめない
+ */
+function isValidBareUrl(text: string, scan: ScanMatch): boolean {
+  const length = DEFAULT_PROTOCOL.length + scan.consumedEnd - scan.start;
+  return isWithinXUrlLimits(length, text.slice(scan.hostStart, scan.hostEnd));
+}
+
+/**
+ * プロトコルのないドメインのトークン。古い twitter-text（JS 版 1.x の invalidShortDomain）は、
+ * かたまりにパスがなければ、`名前.国別の TLD` のドメイン（`co` と `tv` を除く）を URL にしない。
+ * X のサーバーがどちらの規則で数えるかは確かめられないので、この形は URL とみなす場合の 23 と、
+ * みなさない場合の長さの大きいほうで数える。かたまりにパスがあれば、どちらの規則でも
+ * かたまりの中のドメインはすべて URL になる
+ */
+function bareDomainToken(domain: string, hasPath: boolean): Token {
+  const dot = domain.indexOf(".");
+  const tld = canonicalize(domain.slice(dot + 1));
+  const isShortCountryDomain =
+    !hasPath &&
+    dot === domain.lastIndexOf(".") &&
+    COUNTRY_TLD_SET.has(tld) &&
+    !SPECIAL_SHORT_DOMAIN_TLDS.has(tld);
+  if (isShortCountryDomain) return possibleUrlToken(domain);
+  return { text: domain, weight: URL_WEIGHT };
+}
+
 interface Token {
   text: string;
   weight: number;
@@ -727,35 +790,41 @@ function possibleUrlToken(s: string): Token {
 }
 
 /**
- * text の start から end までを、domains（その範囲の bareDomains）を 1 つずつのトークンとして、
- * 書記素単位に分割する。ドメインは、X が URL とみなせば 23、みなさなければ文字ごとの重み
- * （`みんな` などの TLD は 1 文字 2）なので、その大きいほうで数える。
- * isExtended（X が最後のドメインをパスまで伸ばす）なら、最後のドメインより後ろの書記素を
- * 文字ごとの合計以上で数え、最後のドメインと 1 つのトークンにまとめる。
+ * text の start から scan のかたまりの終わりまでを、domains（かたまりの bareDomains）を
+ * 1 つずつのトークン（bareDomainToken）として、書記素単位に分割する。
+ * パスがあれば、X と同じく最後のドメインをかたまりの終わりまで伸ばし、1 つのトークンにまとめる。
  * 切り詰めでパスの途中を切ると、X が短いパスへのリンクにしてリンク先が変わるため
  */
 function pushDomainTokens(
   tokens: Token[],
   text: string,
   start: number,
-  end: number,
+  scan: ScanMatch,
   domains: readonly BareDomain[],
-  isExtended: boolean,
 ): void {
   let last = start;
   for (const domain of domains) {
-    pushPlainTokens(tokens, text.slice(last, domain.index));
-    tokens.push(possibleUrlToken(domain.text));
-    last = domain.index + domain.text.length;
+    // X は URL の始まりを、正規表現がマッチした位置ではなく、ドメインの部分の中で前の URL の
+    // 後ろから同じ文字列を探した位置とする。手前に同じ文字列が英数字や - を続けて現れると
+    // （`a.comx𠀀a.com/y`）、その位置から読み飛ばす
+    const xStart = text.indexOf(domain.text, Math.max(last, scan.hostStart));
+    pushPlainTokens(tokens, text.slice(last, xStart));
+    tokens.push(bareDomainToken(domain.text, scan.hasPath));
+    last = xStart + domain.text.length;
   }
-  const extendedUrl = isExtended ? tokens.at(-1) : undefined;
+  const end = scan.consumedEnd;
+  const extendedUrl = scan.hasPath ? tokens.at(-1) : undefined;
   if (extendedUrl === undefined) {
     pushPlainTokens(tokens, text.slice(last, end));
     return;
   }
-  const path = text.slice(last, end);
-  extendedUrl.text += path;
-  for (const { segment } of segmenter.segment(path)) {
+  extendedUrl.text += text.slice(last, end);
+  // X は、最後のドメインにポート以降を続けた文字列の長さだけ、最後のドメインの
+  // 始まりから読み飛ばす。最後のドメインより後ろにドメインの部分が残ると、その文字数だけ
+  // かたまりの末尾が残り、割れた絵文字の並びも文字ごとに数える（`a.com👨‍👩‍👧あ.jp/x` は 36）。
+  // 残りは、書記素ごとに文字ごとの合計以上で数える
+  const tail = text.slice(end - (scan.hostEnd - last), end);
+  for (const { segment } of segmenter.segment(tail)) {
     extendedUrl.weight += graphemeOrCodePointsWeight(segment);
   }
 }
@@ -810,17 +879,31 @@ function tokenize(text: string): Token[] {
       continue;
     }
     // プロトコルのないかたまり。X はドメインの部分の中の validAsciiDomain のドメインを URL にし、
-    // パスがあれば最後のドメインをかたまりの終わりまで伸ばす。ポート・パス・クエリは
-    // 文字として数えても、X より少なくはならない。
-    // ただし X は、伸ばした URL の文字列（`a.com/x`）の長さだけ読み飛ばしてから続きを数える。
-    // 最後のドメインとパスの間に日本語などがあると、途中から数え始め、割れた絵文字の並びを
-    // 文字ごとに数える（`a.com👨‍👩‍👧あ.jp/x` は 36）。そのときは、最後のドメインより後ろの
-    // 書記素を文字ごとの合計以上で数える（pushDomainTokens を参照）
+    // パスがあれば最後のドメインをかたまりの終わりまで伸ばす（pushDomainTokens を参照）。
     // ドメインは X と同じく走査の始まりから探す。戻した分も含めると、`\u0301\u0301a.com` の
-    // 1 つ目の結合文字（X は直前の文字として消費する）までドメインとして数えてしまう
-    const domains = bareDomains(text, start, hostEnd);
-    const isExtended = domains.length > 0 && scan.hasPath;
-    pushDomainTokens(tokens, text, cut, consumedEnd, domains, isExtended);
+    // 1 つ目の結合文字（X は直前の文字として消費する）までドメインとして数えてしまう。
+    // 直前の文字で URL にしないかたまりでは、ドメインを探さない
+    const domains = hasBlockingPrecedingChar(text, scan)
+      ? []
+      : bareDomains(text, start, hostEnd);
+    const first = domains[0];
+    // X が URL にしないかたまりは、文字として数える。直前の文字で URL にしないかたまりは、
+    // 途中で切っても直前の文字が残るので、書記素ごとに分ける
+    if (first === undefined) {
+      pushPlainTokens(tokens, text.slice(cut, consumedEnd));
+      continue;
+    }
+    // 長さやラベルで URL にしないかたまりは、ドメインから後ろを途中で切ると、X が短いパスや
+    // 手前のドメインへのリンクにしうるので、1 つのトークンにまとめる。日本語に続くドメインでは
+    // 日本語もラベルになり、長いラベルで URL にならないことが多い。最初のドメインより手前は
+    // 切ってもリンクにならないので、本文を残せるよう書記素ごとに分ける
+    if (!isValidBareUrl(text, scan)) {
+      pushPlainTokens(tokens, text.slice(cut, first.index));
+      const rest = text.slice(first.index, consumedEnd);
+      tokens.push({ text: rest, weight: plainWeight(rest) });
+      continue;
+    }
+    pushDomainTokens(tokens, text, cut, scan, domains);
   }
   pushPlainTokens(tokens, text.slice(last));
   return mergeSplitGraphemes(tokens, isBoundary);
@@ -877,7 +960,8 @@ export interface TruncateResult {
 
 /**
  * 重み付き文字数が max を超える場合、末尾を切り詰めて ellipsis を付ける。
- * URL とドメインは途中で切らず、入りきらなければまるごと落とす。
+ * X が URL とみなしうる範囲とドメインは途中で切らず、入りきらなければまるごと落とす。
+ * 直前の文字で X が URL にしないかたまりは、途中で切る。
  */
 export function truncateWeighted(
   text: string,
