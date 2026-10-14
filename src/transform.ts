@@ -48,8 +48,11 @@ export function shouldForward(note: MisskeyNote, config: Config): FilterResult {
 }
 
 // 関数名には、リンクの変換で置く目印（U+FDD0〜U+FDD2）を含めない。含めると、崩れた MFM
-// （`$[tada[ ](url)]`）で目印と URL を関数名として読み、リンクが丸ごと消える
-const MFM_FN_PATTERN = /\$\[[^\s[\]\uFDD0-\uFDD2]+ ?([^[\]]*)\]/g;
+// （`$[tada[ ](url)]`）で目印と URL を関数名として読み、リンクが丸ごと消える。
+// 関数名と中身を 1 つの正規表現で分けると、`]` で閉じていない `$[` の後ろで境目をすべて試し、
+// 長さの二乗の時間がかかる。閉じた `$[...]` を見つけてから、関数名を取り除く
+const MFM_FN_PATTERN = /\$\[([^\s[\]\uFDD0-\uFDD2][^[\]]*)\]/g;
+const MFM_FN_NAME_PATTERN = /^[^\s[\]\uFDD0-\uFDD2]+ ?/;
 const MFM_LINK_PATTERN =
   /\??\[([^[\]\n]+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)/giu;
 // 変換した URL の前後に置く目印。前後の文字は MFM の記号を取り除くまで確定しないため、
@@ -319,7 +322,10 @@ export function stripMfm(text: string): string {
   // リンクのラベルに $[...] があったり、$[...] の中にリンクがあったりするため、
   // リンクの変換と交互に繰り返す
   for (let i = 0; i < 32; i++) {
-    const next = convertMfmLinks(out).replace(MFM_FN_PATTERN, "$1");
+    const next = convertMfmLinks(out).replace(
+      MFM_FN_PATTERN,
+      (_, inner: string) => inner.replace(MFM_FN_NAME_PATTERN, ""),
+    );
     if (next === out) break;
     out = next;
   }
