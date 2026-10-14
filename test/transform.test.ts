@@ -74,6 +74,13 @@ describe("stripMfm", () => {
     expect(stripMfm("$[fg.color=f00 赤] と $[blur 秘密]")).toBe("赤 と 秘密");
   });
 
+  test.each(["$[ x]", "$[]", "$[\nx]"])(
+    "関数名のない %j は MFM の関数記法ではないので残す",
+    (text) => {
+      expect(stripMfm(text)).toBe(text);
+    },
+  );
+
   test("MFM タグと太字・打ち消し記号を取り除く", () => {
     expect(stripMfm("<center>**太字**</center>")).toBe("太字");
     expect(stripMfm("<small>小さい</small> ~~消し~~")).toBe("小さい 消し");
@@ -239,6 +246,20 @@ describe("stripMfm", () => {
         findUrls(stripMfm("あx[ ](https://a.com/x)".repeat(n))),
       ).toHaveLength(n);
     }
+  });
+
+  test("閉じていない $[ の後ろの長い本文でも時間がかからない", () => {
+    const text = `$[${"あ".repeat(50000)}`;
+    const started = performance.now();
+    expect(stripMfm(text)).toBe(text);
+    // 関数名と中身の境目をすべて試すと、長さの二乗で約 1 秒かかる
+    expect(performance.now() - started).toBeLessThan(100);
+  });
+
+  test("閉じていない $[ の内側の入れ子は展開する", () => {
+    const head = `$[${"a".repeat(2800)}`;
+    const text = `${head}${"$[x ".repeat(31)}y${"]".repeat(31)}`;
+    expect(stripMfm(text)).toBe(`${head}y`);
   });
 });
 
