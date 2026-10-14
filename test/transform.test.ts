@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { loadConfig } from "../src/config";
 import {
   buildPost,
   defuseMentions,
@@ -63,6 +64,22 @@ describe("shouldForward", () => {
     expect(shouldForward(makeNote({ tags: ["NoX"] }), config)).toEqual({
       ok: false,
       reason: "exclude-tag:NoX",
+    });
+  });
+
+  test("除外タグは Misskey と同じく NFKC に正規化して比べる", () => {
+    const c = loadConfig({ MISSKEY_HOOK_SECRET: "s", EXCLUDE_TAGS: "ﾃｽﾄ" });
+    // Misskey は note.tags を NFKC に正規化して小文字にした形で送る
+    expect(shouldForward(makeNote({ tags: ["テスト"] }), c)).toEqual({
+      ok: false,
+      reason: "exclude-tag:テスト",
+    });
+  });
+
+  test("正規化していないノートのタグも、除外タグと比べられる", () => {
+    expect(shouldForward(makeNote({ tags: ["ＮＯＸ"] }), config)).toEqual({
+      ok: false,
+      reason: "exclude-tag:ＮＯＸ",
     });
   });
 });

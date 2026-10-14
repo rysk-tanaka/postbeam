@@ -50,6 +50,28 @@ describe("loadConfig の真偽値", () => {
     ]);
   });
 
+  test("EXCLUDE_TAGS は NFKC に正規化し、全角の ＃ も取り除く", () => {
+    const config = loadConfig({ ...base, EXCLUDE_TAGS: "ﾃｽﾄ, ＮＯＸ, ＃Foo" });
+    expect([...config.excludeTags]).toEqual(["テスト", "nox", "foo"]);
+  });
+
+  test.each([
+    ["＃　nox, # foo", ["nox", "foo"]],
+    ["nox，テスト", ["nox", "テスト"]],
+  ])(
+    "EXCLUDE_TAGS の # の後ろの空白と全角のカンマも扱う（%j）",
+    (value, expected) => {
+      const config = loadConfig({ ...base, EXCLUDE_TAGS: value });
+      expect([...config.excludeTags]).toEqual(expected);
+    },
+  );
+
+  test("VISIBILITIES には NFKC の正規化をかけない", () => {
+    expect(() => loadConfig({ ...base, VISIBILITIES: "ｐｕｂｌｉｃ" })).toThrow(
+      ConfigError,
+    );
+  });
+
   test.each([
     ["POSTER", "twitter"],
     ["CW_MODE", "hide"],
