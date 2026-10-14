@@ -1,4 +1,4 @@
-import type { Config } from "./config";
+import { type Config, normalizeTag } from "./config";
 import type { MisskeyNote } from "./misskey";
 import {
   changesReadingWhenJoined,
@@ -39,8 +39,10 @@ export function shouldForward(note: MisskeyNote, config: Config): FilterResult {
   if (note.cw != null && config.cwMode === "skip") {
     return { ok: false, reason: "cw" };
   }
+  // Misskey は note.tags を正規化して送るが、その前提が崩れても除外が漏れないよう、
+  // こちらでも設定と同じ形にそろえてから比べる
   const excluded = (note.tags ?? []).find((t) =>
-    config.excludeTags.has(t.toLowerCase()),
+    config.excludeTags.has(normalizeTag(t)),
   );
   if (excluded) return { ok: false, reason: `exclude-tag:${excluded}` };
   return { ok: true };

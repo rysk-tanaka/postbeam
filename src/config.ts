@@ -43,11 +43,33 @@ export interface Config {
 
 export class ConfigError extends Error {}
 
+/**
+ * Misskey の normalizeForSearch に合わせる。Misskey は note.tags をこの形で保存するため、
+ * 設定のタグも同じ形にしないと、`ﾃｽﾄ` や `ＮＯＸ` のような全角・半角の表記ゆれで一致しない
+ */
+export function normalizeTag(tag: string): string {
+  return tag.normalize("NFKC").toLowerCase();
+}
+
 function parseList(value: string | undefined, fallback: string): Set<string> {
   return new Set(
     (value ?? fallback)
       .split(",")
       .map((s) => s.trim().toLowerCase().replace(/^#/, ""))
+      .filter((s) => s.length > 0),
+  );
+}
+
+function parseTagList(
+  value: string | undefined,
+  fallback: string,
+): Set<string> {
+  return new Set(
+    // NFKC で全角の `，` や `＃` も半角になるので、分割する前に正規化する
+    normalizeTag(value ?? fallback)
+      .split(",")
+      // `＃　nox` のように # の後ろに空白があっても、名前だけを残す
+      .map((s) => s.trim().replace(/^#/, "").trim())
       .filter((s) => s.length > 0),
   );
 }
@@ -103,7 +125,7 @@ export function loadConfig(env: Env): Config {
     visibilities,
     cwMode: parseEnum("CW_MODE", env.CW_MODE, ["skip", "include"], "skip"),
     includeReplies: parseBool("INCLUDE_REPLIES", env.INCLUDE_REPLIES, false),
-    excludeTags: parseList(env.EXCLUDE_TAGS, "nox"),
+    excludeTags: parseTagList(env.EXCLUDE_TAGS, "nox"),
     appendLink: parseEnum(
       "APPEND_LINK",
       env.APPEND_LINK,
