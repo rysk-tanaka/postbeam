@@ -5,5 +5,11 @@
     "MD024": false,
     "MD033": false
   },
-  "ignores": [".claude/**", ".codex/**", ".tmp/**", "**/node_modules/**"]
+  "ignores": [
+    ".claude/**",
+    ".codex/**",
+    ".tmp/**",
+    "**/node_modules/**",
+    "dist/**"
+  ]
 }
