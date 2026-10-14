@@ -787,6 +787,39 @@ describe("buildPost", () => {
     );
   });
 
+  test.each(["always", "truncated"] as const)(
+    "X が URL とみなすリンクは 23 と数え、本文を上限まで残す（%s）",
+    (appendLink) => {
+      const post = buildPost(
+        makeNote({ text: "あ".repeat(300) }),
+        makeConfig({ appendLink }),
+        link,
+      );
+      // 本文 254 + … 2 + 改行 1 + リンク 23 = 280
+      expect(post.text).toBe(`${"あ".repeat(127)}…\n${link}`);
+    },
+  );
+
+  test.each([
+    ["always", "http://localhost:3000/notes/abc"],
+    ["truncated", "http://localhost:3000/notes/abc"],
+    ["always", "https://misskey.hogehoge/notes/abc"],
+  ] as const)(
+    "X が URL とみなさないリンクも、文字数を数えて上限に収める（%s, %s）",
+    (appendLink, url) => {
+      const post = buildPost(
+        makeNote({ text: "あ".repeat(300) }),
+        makeConfig({ appendLink }),
+        url,
+      );
+      expect(post.truncated).toBe(true);
+      expect(post.text.endsWith(`\n${url}`)).toBe(true);
+      expect(weightedLength(post.text)).toBeLessThanOrEqual(
+        MAX_WEIGHTED_LENGTH,
+      );
+    },
+  );
+
   test("always 設定で本文がなければ、リンクだけにする", () => {
     const c = makeConfig({ appendLink: "always" });
     const note = makeNote({

@@ -8,7 +8,6 @@ import {
   SPACE_PATTERN,
   trimJoinContext,
   truncateWeighted,
-  URL_WEIGHT,
   type UrlMatch,
   weightedLength,
 } from "./weighted-length";
@@ -472,9 +471,11 @@ export function buildPost(
   // もう一度正規化する
   body = defuseMentions(body.trim().normalize("NFC"));
 
-  // リンクを付ける場合は「改行 1 文字 + URL」分を本文の上限から差し引く
+  // リンクを付ける場合は、改行とリンクの重み付き文字数を本文の上限から差し引く。
+  // TLD のないホストのように X が URL とみなさないリンクは、23 ではなく文字ごとの重みで数える
   const withLink = (url: string) => {
-    const r = truncateWeighted(body, MAX_WEIGHTED_LENGTH - (URL_WEIGHT + 1));
+    const linkWeight = weightedLength(`\n${url}`);
+    const r = truncateWeighted(body, MAX_WEIGHTED_LENGTH - linkWeight);
     return {
       text: r.text ? `${r.text}\n${url}` : url,
       truncated: r.truncated,
