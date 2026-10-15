@@ -488,6 +488,57 @@ describe("stripCustomEmoji", () => {
   });
 
   test.each([
+    "github.com/foo/bar/blob/main/a:b:c",
+    "見て→github.com/x/y#L1:abc:2",
+    "example.com/a:x:b?q=1",
+  ])(
+    "X がパスまでリンクにするプロトコルのない URL %j の中は書き換えない",
+    (text) => {
+      expect(stripCustomEmoji(text)).toBe(text);
+    },
+  );
+
+  test.each([
+    // X の走査は末尾の : をパスに含めないので、絵文字はかたまりの外まで続く。
+    // Misskey ではプロトコルのないドメインは URL ではなく、絵文字として表示される
+    ["example.com/page:blobcat: すごい", "example.com/page すごい"],
+    ["example.com:blobcat: すごい", "example.com すごい"],
+  ])(
+    "プロトコルのない URL の末尾にかかる絵文字 %j は取り除く",
+    (input, expected) => {
+      expect(stripCustomEmoji(input)).toBe(expected);
+    },
+  );
+
+  test.each([
+    // パスがなければ、X はドメインだけをリンクにする
+    ["example.com?q=:blob:x", "example.com?q= x"],
+    // 直前の - _ . / では、X はかたまりをリンクにしない
+    ["-example.com/a:blob:b", "-example.com/a b"],
+    ["foo_example.com/a:blob:b", "foo_example.com/a b"],
+    // 64 文字のラベルは、X が URL にしない
+    [`${"x".repeat(64)}.com/a:x:b`, `${"x".repeat(64)}.com/a b`],
+    // ASCII のドメインがなければ、X は URL にしない
+    ["例え.jp/a:x:b", "例え.jp/a b"],
+  ])(
+    "X がパスまでリンクにしないかたまり %j の絵文字は取り除く",
+    (input, expected) => {
+      expect(stripCustomEmoji(input)).toBe(expected);
+    },
+  );
+
+  test.each([
+    // 2 つ目以降のかたまりも、中の :name: を残し、間の絵文字は取り除く
+    ["a.com/x:p:y :q: b.com/z:r:w", "a.com/x:p:y b.com/z:r:w"],
+    ["https://a.com/:x: b.com/:y:z", "https://a.com/:x: b.com/:y:z"],
+  ])(
+    "プロトコルのない URL が並ぶ %j も、それぞれの中を残す",
+    (input, expected) => {
+      expect(stripCustomEmoji(input)).toBe(expected);
+    },
+  );
+
+  test.each([
     ["今日はmisskey.ioで遊んだ:blobcat:".repeat(100)],
     [".:x:".repeat(750)],
     ["@a.:x:".repeat(500)],
@@ -872,6 +923,11 @@ describe("buildPost", () => {
       config,
     );
     expect(post.text).toBe("a https://a.com/path");
+  });
+
+  test("プロトコルのない URL の中の :name: は残す", () => {
+    const text = "見て github.com/foo/bar/blob/main/a:b:c";
+    expect(buildPost(makeNote({ text }), config).text).toBe(text);
   });
 
   test("リンク記法の直後の絵文字を取り除いても、URL を後ろの本文につなげない", () => {
