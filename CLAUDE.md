@@ -89,6 +89,7 @@ Worker の `fetch` は、`handleRequest` の処理全体を `ctx.waitUntil` に�
 - Buffer の GraphQL: `ChannelId` と `mode: shareNow` は実際の API で確認済み。画像は `assets: [{ image: { url } }]`（2026 年 5 月の仕様変更後の配列形式、型名は `AssetInput`）
 - Buffer は `assets: null` を受け付けず「Argument "input" has invalid value」を返す。画像がないときは `createPostMutation(false)` で assets を変数ごと含めない
 - Buffer API キーの権限は `posts:write` だけで足りる。API で取得するには `account:read` などの追加権限が要るため、チャンネル ID は Web 画面の URL から取得する
+- 除外タグは `note.tags` と比べる。Misskey は `note.tags` を本文・CW・投票の選択肢から集めて 32 個に切り詰めるため、32 個以上あるときは CW・本文・投票の選択肢からもハッシュタグを切り出し、Misskey と同じくタグごとに正規化して比べる。mfm-js は移植せず、除外しすぎる側に倒す（コードや URL の中も探し、直前の文字は見ず、対応の取れた括弧も区切りとみなし、全角の `＃` も始まりとみなす）
 - メンションの無害化は `@` の直後にゼロ幅スペース（U+200B）を挟む方式。全角の `＠` は X でもメンションとして扱われるため使わない
 - 文字数カウントは Buffer の作成画面の残り文字数表示（「てすとなう」で残り 270）と一致することを確認済み
 - 絵文字（`Extended_Pictographic`）を含む書記素は、RGI の並びなら 2、それ以外は文字ごとの重みの合計で最低 2。`❤︎` や、標準にない ZWJ・肌色の組み合わせが後者に当たる。twitter-text 3.1.0 の `parseTweet` と照らし合わせて決めた。`🇯🇵` のような地域指示子の旗とキーキャップは文字ごとの合計で、X より多めになる。例外として、`🧑‍💻`・`♾️`・`🐦‍🔥` のように twitter-text 3.1.0 の絵文字の表にない RGI の並びは 2 と数え、X が古い表を使っていれば 2〜7 少なく数える

@@ -82,6 +82,99 @@ describe("shouldForward", () => {
       reason: "exclude-tag:ＮＯＸ",
     });
   });
+
+  describe("note.tags が切り詰められたかもしれないとき", () => {
+    // Misskey は note.tags を 32 個までしか保存しないので、33 個目以降の #nox は届かない
+    const tags = Array.from({ length: 32 }, (_, i) => `t${i}`);
+    const text = `${tags.map((t) => `#${t}`).join(" ")} #nox`;
+
+    test("本文の除外タグで除外する", () => {
+      expect(shouldForward(makeNote({ tags, text }), config)).toEqual({
+        ok: false,
+        reason: "exclude-tag:nox",
+      });
+    });
+
+    test("CW と投票の選択肢の除外タグでも除外する", () => {
+      const cw = makeNote({ tags, text: "本文", cw: "注意 #nox" });
+      expect(shouldForward(cw, makeConfig({ cwMode: "include" }))).toEqual({
+        ok: false,
+        reason: "exclude-tag:nox",
+      });
+      const poll = makeNote({
+        tags,
+        text: "本文",
+        poll: { choices: [{ text: "はい" }, { text: "いいえ #nox" }] },
+      });
+      expect(shouldForward(poll, config)).toEqual({
+        ok: false,
+        reason: "exclude-tag:nox",
+      });
+    });
+
+    test("note.tags が 32 個未満なら、本文は探さない", () => {
+      const note = makeNote({ tags: tags.slice(1), text });
+      expect(shouldForward(note, config)).toEqual({ ok: true });
+    });
+
+    // 全角の記号は、正規化する前は区切りにならない（Misskey のタグも `nox！` になる）
+    test.each(["#noxious", "#nox。", "#nox！", "nox"])(
+      "%j は除外タグのハッシュタグではないので除外しない",
+      (tail) => {
+        const note = makeNote({ tags, text: `${text.slice(0, -5)} ${tail}` });
+        expect(shouldForward(note, config)).toEqual({ ok: true });
+      },
+    );
+
+    test.each([
+      "#nox)",
+      "#nox\n続き",
+      "#nox　続き",
+      "#nox.",
+      "#nox#a",
+      "#noxious #nox",
+      // 直前の文字は見ない。正規化すると全角の ａ が a になり、Misskey と判定がずれるため
+      "ａ#nox",
+      "a#nox",
+      // 全角の ＃ は Misskey ではタグにならないが、多めに除外する
+      "＃nox",
+      "#nox＃a",
+      // 結合文字は区切りの後ろにあっても、タグの正規化に影響しない
+      "#nox≮",
+    ])("%j は除外する", (tail) => {
+      const note = makeNote({ tags, text: `${text.slice(0, -5)} ${tail}` });
+      expect(shouldForward(note, config).ok).toBe(false);
+    });
+
+    test("切り出したタグを Misskey と同じく NFKC に正規化して比べ、書かれたままのタグを理由にする", () => {
+      const c = loadConfig({
+        MISSKEY_HOOK_SECRET: "s",
+        EXCLUDE_TAGS: "テスト",
+      });
+      for (const tag of ["ﾃｽﾄ", "テスト"]) {
+        const note = makeNote({ tags, text: `本文 #${tag}` });
+        expect(shouldForward(note, c)).toEqual({
+          ok: false,
+          reason: `exclude-tag:${tag}`,
+        });
+      }
+      const upper = makeNote({ tags, text: "本文 #NOX" });
+      expect(shouldForward(upper, config)).toEqual({
+        ok: false,
+        reason: "exclude-tag:NOX",
+      });
+    });
+
+    test("タグの外の文字は、タグの小文字化に影響しない", () => {
+      // 語末の Σ は ς になる。本文ごと小文字にすると、後ろの文字で σ になり一致しない
+      const c = loadConfig({ MISSKEY_HOOK_SECRET: "s", EXCLUDE_TAGS: "ΝΟΞΣ" });
+      const note = makeNote({ tags, text: "本文 #ΝΟΞΣ.Α" });
+      expect(shouldForward(note, c)).toEqual({
+        ok: false,
+        reason: "exclude-tag:ΝΟΞΣ",
+      });
+    });
+  });
 });
 
 describe("stripMfm", () => {
