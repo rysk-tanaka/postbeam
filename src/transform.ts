@@ -2,7 +2,7 @@ import { type Config, normalizeTag } from "./config";
 import { MISSKEY_MAX_NOTE_TAGS, type MisskeyNote } from "./misskey";
 import {
   changesReadingWhenJoined,
-  findProtocolChunks,
+  findLinkChunks,
   findUrls,
   MAX_WEIGHTED_LENGTH,
   SPACE_PATTERN,
@@ -419,11 +419,24 @@ export function stripCustomEmoji(text: string): string {
   // 詰めるか区切るかを前後の語で決める箇所は、いったん目印にする。同じ語の中に絵文字が
   // 並ぶと、1 つずつ詰めても変わらないのに、まとめて詰めると読み方が変わることがある
   // （`https://a.com:a:.:b:jp` が `https://a.com.jp` になる）
+  const chunks = findLinkChunks(text);
+  const bareChunks = chunks.filter((c) => !c.hasProtocol);
+  let bareIndex = 0;
   const marked = replaceOutsideUrls(
     text,
     CUSTOM_EMOJI_RUN_PATTERN,
     (match, [before = "", after = ""], start) => {
       const end = start + match.length;
+      // X がパスまでリンクにするプロトコルのない URL の中の `:name:` は、リンク先の一部なので
+      // 書き換えない。Misskey はプロトコルのないドメインを URL にしないので、かたまりの末尾に
+      // かかる絵文字は取り除く
+      // マッチもかたまりも前から順に並ぶので、手前で終わったかたまりは読み飛ばす。
+      // 毎回すべてを確かめると、かたまりの多い長い本文で長さの二乗の時間がかかる
+      while ((bareChunks[bareIndex]?.end ?? Infinity) <= start) bareIndex++;
+      const chunk = bareChunks[bareIndex];
+      const isInsideBareUrl =
+        chunk !== undefined && start >= chunk.start && end <= chunk.end;
+      if (isInsideBareUrl) return match;
       const isLineStart = start === 0 || text[start - 1] === "\n";
       const isLineEnd =
         end === text.length || text[end] === "\n" || text[end] === "\r";
@@ -436,8 +449,10 @@ export function stripCustomEmoji(text: string): string {
       const startsHashtag = HASHTAG_MARK_PATTERN.test(text.slice(end, end + 1));
       return startsHashtag ? " " : EMOJI_GAP;
     },
-    // findUrls が URL にしない国際化ドメインの URL も、X はリンクにするので書き換えない
-    findProtocolChunks(text),
+    // プロトコルで始まるかたまりは、X のリンク先を変えないよう、重なる絵文字も書き換えない。
+    // findUrls が URL にしない国際化ドメインの URL も、X はリンクにするので含める。
+    // Misskey が URL にせず、絵文字として表示する場合も、リンク先を変えないことを優先する
+    chunks.filter((c) => c.hasProtocol),
   );
   if (!marked.includes(EMOJI_GAP)) return marked;
   const changesReading = createReadingCheck();

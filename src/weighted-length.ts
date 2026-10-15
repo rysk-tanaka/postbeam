@@ -573,17 +573,35 @@ export function findUrls(text: string): UrlMatch[] {
   return matches;
 }
 
+export interface LinkChunk extends UrlMatch {
+  /** プロトコルで始まるかたまりか。false はプロトコルのないドメインのかたまり */
+  hasProtocol: boolean;
+}
+
 /**
- * 本文中の、プロトコルで始まる走査のかたまりの位置。X が URL とみなすかによらず、走査が
- * 消費した範囲を返す。findUrls が URL にしない国際化ドメインの URL も含むので、中を書き換えると
- * X のリンク先が変わりうる範囲として使う。広い側にずれるので、メンションの無害化には使わない
+ * 本文中の、中を書き換えると X のリンク先が変わりうる走査のかたまりの位置。
+ * - プロトコルで始まるかたまりは、X が URL とみなすかによらず、走査が消費した範囲を返す。
+ *   findUrls が URL にしない国際化ドメインの URL も含み、広い側にずれるので、
+ *   メンションの無害化には使わない
+ * - プロトコルのないかたまりは、X が最後のドメインをかたまりの終わりまで伸ばしてリンクにする
+ *   もの（isBarePathLinked）だけを返す。パスのないかたまりは、X がドメインだけをリンクにする
  */
-export function findProtocolChunks(text: string): UrlMatch[] {
-  const chunks: UrlMatch[] = [];
-  for (const { start, hostStart, consumedEnd } of scanUrls(text)) {
-    if (hostStart > start) chunks.push({ start, end: consumedEnd });
+export function findLinkChunks(text: string): LinkChunk[] {
+  const chunks: LinkChunk[] = [];
+  for (const scan of scanUrls(text)) {
+    const hasProtocol = scan.hostStart > scan.start;
+    if (!hasProtocol && !isBarePathLinked(text, scan)) continue;
+    chunks.push({ start: scan.start, end: scan.consumedEnd, hasProtocol });
   }
   return chunks;
+}
+
+/**
+ * プロトコルのないかたまりのパスまでを、X がリンクにするか。tokenize が pushDomainTokens で
+ * パスまで 1 つの URL として数える場合に当たる
+ */
+function isBarePathLinked(text: string, scan: ScanMatch): boolean {
+  return scan.hasPath && classifyBareChunk(text, scan).kind === "linked";
 }
 
 /** 走査のマッチを比べるためのキー。offset だけずらす */
@@ -750,6 +768,30 @@ function isValidBareUrl(text: string, scan: ScanMatch): boolean {
 }
 
 /**
+ * プロトコルのないかたまりを X がどう扱うか。
+ * - unlinked: ドメインを 1 つも URL にしない（直前の文字で URL にしないか、ドメインがない）
+ * - invalid: ドメインはあるが、長さやラベルで URL にしない（isValidBareUrl）
+ * - linked: ドメインを URL にする（pushDomainTokens を参照）
+ */
+type BareChunk =
+  | { kind: "unlinked" }
+  | { kind: "invalid"; first: BareDomain }
+  | { kind: "linked"; domains: BareDomain[] };
+
+/**
+ * tokenize の数え方と findLinkChunks の範囲を、同じ判定で決めるために分ける。
+ * ドメインは X と同じく走査の始まりから探す（tokenize を参照）
+ */
+function classifyBareChunk(text: string, scan: ScanMatch): BareChunk {
+  if (hasBlockingPrecedingChar(text, scan)) return { kind: "unlinked" };
+  const domains = bareDomains(text, scan.start, scan.hostEnd);
+  const first = domains[0];
+  if (first === undefined) return { kind: "unlinked" };
+  if (!isValidBareUrl(text, scan)) return { kind: "invalid", first };
+  return { kind: "linked", domains };
+}
+
+/**
  * プロトコルのないドメインのトークン。古い twitter-text（JS 版 1.x の invalidShortDomain）は、
  * かたまりにパスがなければ、`名前.国別の TLD` のドメイン（`co` と `tv` を除く）を URL にしない。
  * X のサーバーがどちらの規則で数えるかは確かめられないので、この形は URL とみなす場合の 23 と、
@@ -863,7 +905,7 @@ function tokenize(text: string): Token[] {
   const isBoundary = createBoundaryChecker(text);
   let last = 0;
   for (const scan of scanUrls(text)) {
-    const { start, hostStart, hostEnd, consumedEnd } = scan;
+    const { start, hostStart, consumedEnd } = scan;
     const hasProtocol = hostStart > start;
     // 走査は直前の 1 文字を UTF-16 の単位で消費するので、絵文字の下位サロゲートや異体字
     // セレクター（`❤️` の U+FE0F）からプロトコルのないかたまりを読むことがある。書記素を
@@ -883,13 +925,10 @@ function tokenize(text: string): Token[] {
     // ドメインは X と同じく走査の始まりから探す。戻した分も含めると、`\u0301\u0301a.com` の
     // 1 つ目の結合文字（X は直前の文字として消費する）までドメインとして数えてしまう。
     // 直前の文字で URL にしないかたまりでは、ドメインを探さない
-    const domains = hasBlockingPrecedingChar(text, scan)
-      ? []
-      : bareDomains(text, start, hostEnd);
-    const first = domains[0];
+    const bare = classifyBareChunk(text, scan);
     // X が URL にしないかたまりは、文字として数える。直前の文字で URL にしないかたまりは、
     // 途中で切っても直前の文字が残るので、書記素ごとに分ける
-    if (first === undefined) {
+    if (bare.kind === "unlinked") {
       pushPlainTokens(tokens, text.slice(cut, consumedEnd));
       continue;
     }
@@ -897,13 +936,13 @@ function tokenize(text: string): Token[] {
     // 手前のドメインへのリンクにしうるので、1 つのトークンにまとめる。日本語に続くドメインでは
     // 日本語もラベルになり、長いラベルで URL にならないことが多い。最初のドメインより手前は
     // 切ってもリンクにならないので、本文を残せるよう書記素ごとに分ける
-    if (!isValidBareUrl(text, scan)) {
-      pushPlainTokens(tokens, text.slice(cut, first.index));
-      const rest = text.slice(first.index, consumedEnd);
+    if (bare.kind === "invalid") {
+      pushPlainTokens(tokens, text.slice(cut, bare.first.index));
+      const rest = text.slice(bare.first.index, consumedEnd);
       tokens.push({ text: rest, weight: plainWeight(rest) });
       continue;
     }
-    pushDomainTokens(tokens, text, cut, scan, domains);
+    pushDomainTokens(tokens, text, cut, scan, bare.domains);
   }
   pushPlainTokens(tokens, text.slice(last));
   return mergeSplitGraphemes(tokens, isBoundary);
