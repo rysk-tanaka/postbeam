@@ -18,9 +18,16 @@ export interface MisskeyNote {
   renoteId?: string | null;
   files?: MisskeyFile[];
   tags?: string[];
+  poll?: { choices: { text: string }[] } | null;
   url?: string | null;
   uri?: string | null;
 }
+
+/**
+ * Misskey の NoteCreateService が保存する note.tags の上限。本文・CW・投票の選択肢から
+ * 集めたタグを先頭からこの個数に切り詰めるため、それより後ろのタグは webhook に届かない
+ */
+export const MISSKEY_MAX_NOTE_TAGS = 32;
 
 /**
  * Misskey の user webhook の payload。

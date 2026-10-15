@@ -1,5 +1,5 @@
 import { type Config, normalizeTag } from "./config";
-import type { MisskeyNote } from "./misskey";
+import { MISSKEY_MAX_NOTE_TAGS, type MisskeyNote } from "./misskey";
 import {
   changesReadingWhenJoined,
   findProtocolChunks,
@@ -45,7 +45,44 @@ export function shouldForward(note: MisskeyNote, config: Config): FilterResult {
     config.excludeTags.has(normalizeTag(t)),
   );
   if (excluded) return { ok: false, reason: `exclude-tag:${excluded}` };
+  // Misskey は note.tags を 32 個までしか保存しないため、33 個目以降に書いた除外タグは届かない。
+  // 切り詰められたかもしれないときは、Misskey がタグを集める CW・本文・投票の選択肢からも探す
+  const mayBeTruncated = (note.tags?.length ?? 0) >= MISSKEY_MAX_NOTE_TAGS;
+  if (mayBeTruncated) {
+    const tag = findExcludedHashtag(note, config.excludeTags);
+    if (tag) return { ok: false, reason: `exclude-tag:${tag}` };
+  }
   return { ok: true };
+}
+
+// `#` から、mfm-js がハッシュタグの文字として認めない文字の手前までを切り出す。
+// 対応の取れた括弧は mfm-js ではタグに含まれ（`#nox(a)` のタグは `nox(a)`）、全角の `＃` は
+// タグの始まりにならないが、どちらも区切りとみなして多めに除外する
+const HASHTAG_PATTERN = /[#＃]([^\s.,!?'"#＃:/[\]【】()「」（）<>]+)/gu;
+
+/**
+ * 本文などから除外タグのハッシュタグを探し、本文に書かれたままのタグを返す。mfm-js のパーサーは
+ * 移植せず、除外しすぎる側に倒す。コードや URL の中も区別せず、直前が英数字の `a#nox` も当たりとする
+ * （正規化すると全角の `ａ` が `a` になり、直前の文字の判定が Misskey とずれて除外が漏れるため）
+ */
+function findExcludedHashtag(
+  note: MisskeyNote,
+  excludeTags: ReadonlySet<string>,
+): string | undefined {
+  const sources = [
+    note.cw,
+    note.text,
+    ...(note.poll?.choices ?? []).map((c) => c?.text),
+  ];
+  for (const source of sources) {
+    if (typeof source !== "string") continue;
+    for (const [, tag] of source.matchAll(HASHTAG_PATTERN)) {
+      // Misskey と同じく、切り出したタグごとに正規化する。本文ごと正規化すると、語末の Σ の
+      // 小文字や結合文字の合成がタグの外の文字に左右され、区切りの位置もずれる
+      if (tag && excludeTags.has(normalizeTag(tag))) return tag;
+    }
+  }
+  return undefined;
 }
 
 // 関数名には、リンクの変換で置く目印（U+FDD0〜U+FDD2）を含めない。含めると、崩れた MFM
