@@ -1,17 +1,11 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
-  "enabledManagers": ["npm", "github-actions"],
-  "labels": ["dependencies"],
-  "timezone": "Asia/Tokyo",
-  "schedule": ["before 9am on saturday"],
-  "minimumReleaseAge": "3 days",
+  "extends": [
+    "github>rysk-tanaka/workflows#41caae6bf816cb53a25c1a03637b73992f6b38b1"
+  ],
+  "enabledManagers": ["npm", "github-actions", "custom.regex"],
   "lockFileMaintenance": { "enabled": true },
   "packageRules": [
-    {
-      "matchUpdateTypes": ["minor", "patch"],
-      "automerge": true
-    },
     {
       "description": "workers-types と wrangler は日付ベースで頻繁に更新されるため 1 本の PR にまとめる",
       "matchPackageNames": ["wrangler", "@cloudflare/workers-types"],
